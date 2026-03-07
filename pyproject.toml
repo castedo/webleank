@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools >= 69.0.3", "setuptools_scm[simple] >= 8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webleank"
+dynamic = ["version"]
+description = "Link Lean sideick web apps to LSP-enabled editors"
+authors = [{name = "Castedo Ellerman", email = "castedo@castedo.com"}]
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+]
+keywords = ["lsp", "language-server-protocol","jsonrpc"]
+
+[project.scripts]
+webleank = "webleank:main"
+
+[tool.setuptools_scm]
+version_file = "_version.py"
+
+[dependency-groups]
+test = [
+    "pytest >= 8",
+    "pytest-asyncio",
+]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[tool.ruff.format]
+quote-style = "preserve"
+docstring-code-format = false
+
+[tool.ruff.lint]
+ignore = [
+    "E401",  # Multiple imports on one line
+]
