@@ -22,6 +22,10 @@ webleank = "webleank:main"
 [tool.setuptools_scm]
 version_file = "_version.py"
 
+dependencies = [
+    "websockets",
+]
+
 [dependency-groups]
 test = [
     "pytest >= 8",
