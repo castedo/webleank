@@ -1,0 +1,12 @@
+{
+  "extends": "@tsconfig/vite-react/tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "react": ["./node_modules/@leanprover/infoview/dist/react.production.min.js"],
+      "react-dom": ["./node_modules/@leanprover/infoview/dist/react-dom.production.min.js"],
+      "react/jsx-runtime": ["./node_modules/@leanprover/infoview/dist/react-jsx-runtime.production.min.js"]
+    },
+    "types": ["vite/client"]
+  },
+  "include": ["src"]
+}

@@ -9,6 +9,8 @@ test:
 
 clean:
     rm -rf dist
+    rm -rf webapp/dist
+    rm -rf webapp/node_modules
     rm -rf build
     rm -rf *.egg-info
     rm -f _version.py
