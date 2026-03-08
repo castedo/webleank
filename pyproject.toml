@@ -7,24 +7,29 @@ name = "webleank"
 dynamic = ["version"]
 description = "Link Lean sideick web apps to LSP-enabled editors"
 authors = [{name = "Castedo Ellerman", email = "castedo@castedo.com"}]
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX",
 ]
 keywords = ["lsp", "language-server-protocol","jsonrpc"]
+dependencies = [
+    "websockets",
+]
 
 [project.scripts]
 webleank = "webleank:main"
 
+[tool.setuptools.packages.find]
+include = ["webleank*"]
+
+[tool.setuptools.package-data]
+"webleank" = ["webapp/**"]
+
 [tool.setuptools_scm]
 version_file = "_version.py"
-
-dependencies = [
-    "websockets",
-]
 
 [dependency-groups]
 test = [
