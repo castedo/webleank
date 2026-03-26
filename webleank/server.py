@@ -1,10 +1,26 @@
-import http
+from __future__ import annotations
+import asyncio, errno, http, logging
+from asyncio import TaskGroup
 from importlib import resources
 from pathlib import Path
 
-from websockets.asyncio.server import ServerConnection, serve
+import websockets.asyncio.server 
+from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
+
+from lspleanklib import (
+    DuplexStream,
+    JsonRpcChannel,
+    LeankLakeFactory,
+    RpcChannel,
+    RpcDirChannelFactory,
+    RpcSubprocessFactory,
+    channel_lsp_server,
+)
+
+
+log = logging.getLogger('webleank')
 
 
 MIME_TYPES = {'.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript'}
@@ -28,10 +44,33 @@ def load_webapp_files() -> dict[str, bytes]:
     return ret
 
 
-class Server:
+class LeankWebServer:
     def __init__(self) -> None:
+        self._web_port: int
+        self._web_port_server: websockets.asyncio.server.Server
         self._cnt = 0
         self._webapp_files = load_webapp_files()
+
+    @staticmethod
+    async def bind_web_port(web_port: int) -> LeankWebServer | None:
+        self = LeankWebServer()
+        try:
+            self._web_port = web_port
+            self._web_port_server = await websockets.asyncio.server.serve(
+                self.ack,
+                'localhost',
+                self._web_port,
+                process_request=self.webapp_http_server,
+                start_serving=False,
+            )
+            return self
+        except OSError as ex:
+            if ex.errno != errno.EADDRINUSE:
+                raise ex
+        return None
+
+    async def start_serving(self) -> None:
+        await self._web_port_server.start_serving()
 
     async def ack(self, websocket: ServerConnection) -> None:
         self._cnt += 1
@@ -57,8 +96,56 @@ class Server:
             return connection.respond(http.HTTPStatus.NOT_FOUND, "NOT FOUND")
         return None
 
-    async def run(self, port: int = 1342) -> None:
-        async with serve(
-            self.ack, 'localhost', port, process_request=self.webapp_http_server
-        ) as server:
-            await server.serve_forever()
+
+LINGER_SECONDS = 5
+
+
+class LeankSocketServer:
+    def __init__(self, factory: RpcDirChannelFactory, tg: TaskGroup):
+        self._factory = factory
+        self._socket_tasks = tg
+        self._loop = asyncio.get_running_loop()
+        self._staying_alive()
+
+    def on_connect(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        log.debug("socket connected")
+        aio = DuplexStream(reader, writer)
+        sock_chan = JsonRpcChannel(aio, self._loop, 'socket')
+        self._socket_tasks.create_task(self._async_on_connect(sock_chan))
+
+    async def _async_on_connect(self, sock_chan: RpcChannel) -> None:
+        try:
+            async with TaskGroup() as connection_tasks:
+                server = channel_lsp_server(
+                    self._factory, sock_chan.proxy, connection_tasks
+                )
+                connection_tasks.create_task(sock_chan.pump(server))
+        except Exception as ex:
+            log.exception(ex)
+        finally:
+            log.debug("socket finished")
+            self._staying_alive()
+
+    def _staying_alive(self) -> None:
+        # Ah, ah, ah, ah ... stayin' alive ... stayin' alive
+        log.debug(f"staying alive {LINGER_SECONDS} seconds")
+        self._socket_tasks.create_task(asyncio.sleep(LINGER_SECONDS))
+
+
+async def run_server(web_port: int, sock_path: Path) -> bool:
+    lake_cmd = ['lake', 'serve']
+    loop = asyncio.get_running_loop()
+    web_server = await LeankWebServer.bind_web_port(web_port)
+    if web_server is None:
+        return False
+    async with TaskGroup() as tg:
+        tg.create_task(web_server.start_serving())
+        lake_factory = RpcSubprocessFactory(lake_cmd, loop)
+        leank_factory = LeankLakeFactory(lake_factory)
+        socker = LeankSocketServer(leank_factory, tg)
+        await asyncio.start_unix_server(socker.on_connect, sock_path)
+        log.info(f"listening on socket {sock_path}")
+        # will exit when TaskGroup tasks complete
+    return True
