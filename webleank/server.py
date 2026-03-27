@@ -1,6 +1,7 @@
 from __future__ import annotations
-import asyncio, errno, http, logging
+import asyncio, errno, http, logging, os
 from asyncio import TaskGroup
+from contextlib import suppress
 from importlib import resources
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from lspleanklib import (
 )
 
 
-log = logging.getLogger('webleank')
+log = logging.getLogger(__spec__.parent)
 
 
 MIME_TYPES = {'.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript'}
@@ -140,12 +141,16 @@ async def run_server(web_port: int, sock_path: Path) -> bool:
     web_server = await LeankWebServer.bind_web_port(web_port)
     if web_server is None:
         return False
-    async with TaskGroup() as tg:
-        tg.create_task(web_server.start_serving())
-        lake_factory = RpcSubprocessFactory(lake_cmd, loop)
-        leank_factory = LeankLakeFactory(lake_factory)
-        socker = LeankSocketServer(leank_factory, tg)
-        await asyncio.start_unix_server(socker.on_connect, sock_path)
-        log.info(f"listening on socket {sock_path}")
-        # will exit when TaskGroup tasks complete
+    try:
+        async with TaskGroup() as tg:
+            tg.create_task(web_server.start_serving())
+            lake_factory = RpcSubprocessFactory(lake_cmd, loop)
+            leank_factory = LeankLakeFactory(lake_factory)
+            socker = LeankSocketServer(leank_factory, tg)
+            await asyncio.start_unix_server(socker.on_connect, sock_path)
+            log.info(f"listening on socket {sock_path}")
+            # will exit when TaskGroup tasks complete
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(sock_path)
     return True

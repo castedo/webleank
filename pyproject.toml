@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-webleank = "webleank:main"
+webleank = "webleank.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["webleank*"]
