@@ -1,11 +1,14 @@
 from __future__ import annotations
-import asyncio, errno, http, logging, os
+import asyncio, errno, http, json, logging, os, tomli
 from asyncio import TaskGroup
+from collections.abc import Sequence
 from contextlib import suppress
 from importlib import resources
 from pathlib import Path
+from urllib.parse import urlsplit
 
-import websockets.asyncio.server 
+from platformdirs import user_config_path
+import websockets.asyncio.server
 from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
@@ -45,20 +48,33 @@ def load_webapp_files() -> dict[str, bytes]:
     return ret
 
 
+class AllowedDomains:
+    def __init__(self, domains: Sequence[str]):
+        self._domains = [d.split('.') for d in domains]
+
+    def is_allowed(self, origin: str | None) -> bool:
+        if origin:
+            parts = origin.split('.')
+            for allowed in self._domains:
+                if parts[-len(allowed):] == allowed:
+                    return True
+        return False
+
+
 class LeankWebServer:
-    def __init__(self, web_port: int, tg: TaskGroup) -> None:
+    def __init__(self, web_port:int, domains: AllowedDomains, tg: TaskGroup) -> None:
         self._web_port = web_port
         self._tg = tg
-        self._cnt = 0
         self._webapp_files = load_webapp_files()
+        self._domains = domains
 
     async def start(self) -> bool:
         try:
             web_port_server = await websockets.asyncio.server.serve(
-                self.ack,
+                self._on_connect,
                 'localhost',
                 self._web_port,
-                process_request=self.webapp_http_server,
+                process_request=self._webapp_http_server,
                 start_serving=False,
             )
         except OSError as ex:
@@ -68,18 +84,22 @@ class LeankWebServer:
         self._tg.create_task(web_port_server.start_serving())
         return True
 
-    async def ack(self, websocket: ServerConnection) -> None:
-        self._cnt += 1
+    async def _on_connect(self, websocket: ServerConnection) -> None:
         if websocket.request:
             origin = websocket.request.headers.get("origin")
-            if origin is not None:
-                await websocket.send(origin)
         if origin is None:
             log.error("Websocket connection missing origin HTTP header")
         else:
-            await websocket.send(str(self._cnt))
+            hostname = urlsplit(origin).hostname
+            if self._domains.is_allowed(hostname):
+                ack = {'jsonrpc': '2.0', 'method': 'ack', 'params': hostname}
+                await websocket.send(json.dumps(ack))
+            else:
+                log.error("Websocket connection origin domain not allowed")
+                nack = {'jsonrpc': '2.0', 'method': 'forbidden', 'params': hostname}
+                await websocket.send(json.dumps(nack))
 
-    def webapp_http_server(
+    def _webapp_http_server(
         self, connection: ServerConnection, request: Request
     ) -> Response | None:
         path = request.path
@@ -130,13 +150,44 @@ class LeankSocketServer:
         self._socket_tasks.create_task(asyncio.sleep(LINGER_SECONDS))
 
 
+CONFIG_FILENAME = 'webleank.toml'
+
+
+def get_config_path() -> Path | None:
+    lean_config_dir = user_config_path('lean')
+    config_path = lean_config_dir / CONFIG_FILENAME
+    if not lean_config_dir.exists():
+        try:
+            default = resources.files(__package__).joinpath('config', CONFIG_FILENAME)
+            os.makedirs(lean_config_dir)
+            with open(config_path , 'wb') as file:
+                file.write(default.read_bytes())
+        except FileExistsError:
+            pass
+    return config_path if config_path.exists() else None
+
+
+class Config:
+    def __init__(self) -> None:
+        data = {}
+        path = get_config_path()
+        if path is None:
+            domains = []
+        else:
+            with open(path, 'rb') as file:
+                data = tomli.load(file)
+            domains = data.get('allowed', {}).get('domains', [])
+        self.allowed_domains = AllowedDomains(domains)
+
+
 async def run_service(web_port: int, sock_path: Path) -> bool:
+    config = Config()
     lake_cmd = ['lake', 'serve']
     loop = asyncio.get_running_loop()
     lake_factory = RpcSubprocessFactory(lake_cmd, loop)
     leank_factory = LeankLakeFactory(lake_factory)
     async with TaskGroup() as web_tasks:
-        web_server = LeankWebServer(web_port, web_tasks)
+        web_server = LeankWebServer(web_port, config.allowed_domains, web_tasks)
         this_process_got_it = await web_server.start()
         if not this_process_got_it:
             # assume another process is running as service
