@@ -78,8 +78,9 @@ PROG_NAME = "webleank"
 
 
 def main(cmd_line_args: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     logging.captureWarnings(True)
+    log.setLevel(logging.DEBUG)
 
     if not hasattr(socket, 'AF_UNIX'):
         bad_os = "Missing operating system support for UNIX domain sockets"

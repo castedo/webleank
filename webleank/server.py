@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, errno, http, json, logging, os, tomli
+import asyncio, errno, http, logging, os, tomli
 from asyncio import TaskGroup
 from collections.abc import Sequence
 from contextlib import suppress
@@ -16,12 +16,16 @@ from websockets.http11 import Request, Response
 from lspleanklib import (
     DuplexStream,
     JsonRpcChannel,
+    JsonRpcMsgStream,
     LeankLakeFactory,
+    MethodCall,
     RpcChannel,
     RpcDirChannelFactory,
     RpcSubprocessFactory,
     channel_lsp_server,
 )
+
+from .jsonrpc import WebSocketJsonRpcMsgConnection
 
 
 log = logging.getLogger(__spec__.parent)
@@ -67,6 +71,7 @@ class LeankWebServer:
         self._tg = tg
         self._webapp_files = load_webapp_files()
         self._domains = domains
+        self._loop = asyncio.get_event_loop()
 
     async def start(self) -> bool:
         try:
@@ -85,19 +90,22 @@ class LeankWebServer:
         return True
 
     async def _on_connect(self, websocket: ServerConnection) -> None:
-        if websocket.request:
-            origin = websocket.request.headers.get("origin")
+        if websocket.request is None:
+            return
+        if websocket.request.path != '/ws/sidekick':
+            return
+        origin = websocket.request.headers.get("origin")
         if origin is None:
             log.error("Websocket connection missing origin HTTP header")
+            return
+        hostname = urlsplit(origin).hostname
+        conn = WebSocketJsonRpcMsgConnection(websocket, 'sidekick')
+        ws_chan = JsonRpcChannel(conn, self._loop)
+        if self._domains.is_allowed(hostname):
+            await ws_chan.proxy.notify(MethodCall('ack', hostname))
         else:
-            hostname = urlsplit(origin).hostname
-            if self._domains.is_allowed(hostname):
-                ack = {'jsonrpc': '2.0', 'method': 'ack', 'params': hostname}
-                await websocket.send(json.dumps(ack))
-            else:
-                log.error("Websocket connection origin domain not allowed")
-                nack = {'jsonrpc': '2.0', 'method': 'forbidden', 'params': hostname}
-                await websocket.send(json.dumps(nack))
+            log.error("Websocket connection origin domain not allowed")
+            await ws_chan.proxy.notify(MethodCall('forbidden', hostname))
 
     def _webapp_http_server(
         self, connection: ServerConnection, request: Request
@@ -128,7 +136,7 @@ class LeankSocketServer:
     ) -> None:
         log.debug("socket connected")
         aio = DuplexStream(reader, writer)
-        sock_chan = JsonRpcChannel(aio, self._loop, 'socket')
+        sock_chan = JsonRpcChannel(JsonRpcMsgStream(aio,'socket'), self._loop)
         self._socket_tasks.create_task(self._async_on_connect(sock_chan))
 
     async def _async_on_connect(self, sock_chan: RpcChannel) -> None:
