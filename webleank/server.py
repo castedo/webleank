@@ -46,32 +46,27 @@ def load_webapp_files() -> dict[str, bytes]:
 
 
 class LeankWebServer:
-    def __init__(self) -> None:
-        self._web_port: int
-        self._web_port_server: websockets.asyncio.server.Server
+    def __init__(self, web_port: int, tg: TaskGroup) -> None:
+        self._web_port = web_port
+        self._tg = tg
         self._cnt = 0
         self._webapp_files = load_webapp_files()
 
-    @staticmethod
-    async def bind_web_port(web_port: int) -> LeankWebServer | None:
-        self = LeankWebServer()
+    async def start(self) -> bool:
         try:
-            self._web_port = web_port
-            self._web_port_server = await websockets.asyncio.server.serve(
+            web_port_server = await websockets.asyncio.server.serve(
                 self.ack,
                 'localhost',
                 self._web_port,
                 process_request=self.webapp_http_server,
                 start_serving=False,
             )
-            return self
         except OSError as ex:
             if ex.errno != errno.EADDRINUSE:
                 raise ex
-        return None
-
-    async def start_serving(self) -> None:
-        await self._web_port_server.start_serving()
+            return False
+        self._tg.create_task(web_port_server.start_serving())
+        return True
 
     async def ack(self, websocket: ServerConnection) -> None:
         self._cnt += 1
@@ -80,7 +75,7 @@ class LeankWebServer:
             if origin is not None:
                 await websocket.send(origin)
         if origin is None:
-            await websocket.send("no origin, no service")
+            log.error("Websocket connection missing origin HTTP header")
         else:
             await websocket.send(str(self._cnt))
 
@@ -135,22 +130,24 @@ class LeankSocketServer:
         self._socket_tasks.create_task(asyncio.sleep(LINGER_SECONDS))
 
 
-async def run_server(web_port: int, sock_path: Path) -> bool:
+async def run_service(web_port: int, sock_path: Path) -> bool:
     lake_cmd = ['lake', 'serve']
     loop = asyncio.get_running_loop()
-    web_server = await LeankWebServer.bind_web_port(web_port)
-    if web_server is None:
-        return False
-    try:
-        async with TaskGroup() as tg:
-            tg.create_task(web_server.start_serving())
-            lake_factory = RpcSubprocessFactory(lake_cmd, loop)
-            leank_factory = LeankLakeFactory(lake_factory)
-            socker = LeankSocketServer(leank_factory, tg)
-            await asyncio.start_unix_server(socker.on_connect, sock_path)
-            log.info(f"listening on socket {sock_path}")
-            # will exit when TaskGroup tasks complete
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(sock_path)
+    lake_factory = RpcSubprocessFactory(lake_cmd, loop)
+    leank_factory = LeankLakeFactory(lake_factory)
+    async with TaskGroup() as web_tasks:
+        web_server = LeankWebServer(web_port, web_tasks)
+        this_process_got_it = await web_server.start()
+        if not this_process_got_it:
+            # assume another process is running as service
+            return False
+        try:
+            async with TaskGroup() as socket_tasks:
+                socker = LeankSocketServer(leank_factory, socket_tasks)
+                await asyncio.start_unix_server(socker.on_connect, sock_path)
+                log.info(f"listening on socket {sock_path}")
+                # will exit with-context when TaskGroup tasks complete
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(sock_path)
     return True

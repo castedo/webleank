@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "webleank"
 dynamic = ["version"]
-description = "Link Lean sideick web apps to LSP-enabled editors"
+description = "Link Lean sidekick web apps to LSP-enabled editors"
 authors = [{name = "Castedo Ellerman", email = "castedo@castedo.com"}]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,8 +14,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX",
 ]
-keywords = ["lsp", "language-server-protocol","jsonrpc"]
+keywords = ["lean", "lsp", "language-server-protocol"]
 dependencies = [
+    "platformdirs",
     "websockets",
 ]
 

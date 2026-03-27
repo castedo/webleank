@@ -6,7 +6,7 @@ import argparse, asyncio, logging, socket, subprocess, sys
 from pathlib import Path
 from typing import Any
 
-from .server import run_server, log
+from .server import run_service, log
 
 from lspleanklib import get_user_socket_path, lspleank_connect_main
 
@@ -53,7 +53,7 @@ def start_main() -> int:
 async def service_amain(web_port: int) -> int:
     try:
         sock_path = get_user_socket_path()
-        started = await run_server(web_port, sock_path)
+        started = await run_service(web_port, sock_path)
         if not started:
             other_process_got_it = await socket_available(sock_path)
             if not other_process_got_it:
