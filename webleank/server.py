@@ -66,19 +66,18 @@ class AllowedDomains:
 
 
 class LeankWebServer:
-    def __init__(self, web_port:int, domains: AllowedDomains, tg: TaskGroup) -> None:
-        self._web_port = web_port
-        self._tg = tg
+    def __init__(self, domains: AllowedDomains) -> None:
         self._webapp_files = load_webapp_files()
         self._domains = domains
         self._loop = asyncio.get_event_loop()
+        self._server: websockets.asyncio.server.Server | None = None
 
-    async def start(self) -> bool:
+    async def bind_port(self, web_port: int) -> bool:
         try:
-            web_port_server = await websockets.asyncio.server.serve(
+            self._server = await websockets.asyncio.server.serve(
                 self._on_connect,
                 'localhost',
-                self._web_port,
+                web_port,
                 process_request=self._webapp_http_server,
                 start_serving=False,
             )
@@ -86,8 +85,11 @@ class LeankWebServer:
             if ex.errno != errno.EADDRINUSE:
                 raise ex
             return False
-        self._tg.create_task(web_port_server.start_serving())
         return True
+
+    async def start_serving(self) -> None:
+        assert self._server
+        await self._server.start_serving()
 
     async def _on_connect(self, websocket: ServerConnection) -> None:
         if websocket.request is None:
@@ -194,12 +196,13 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
     loop = asyncio.get_running_loop()
     lake_factory = RpcSubprocessFactory(lake_cmd, loop)
     leank_factory = LeankLakeFactory(lake_factory)
-    async with TaskGroup() as web_tasks:
-        web_server = LeankWebServer(web_port, config.allowed_domains, web_tasks)
-        this_process_got_it = await web_server.start()
-        if not this_process_got_it:
-            # assume another process is running as service
-            return False
+    web_port_server = LeankWebServer(config.allowed_domains)
+    this_process_got_it = await web_port_server.bind_port(web_port)
+    if not this_process_got_it:
+        # assume another process is running as service
+        return False
+    async with TaskGroup() as web_port_tasks:
+        web_port_tasks.create_task(web_port_server.start_serving())
         try:
             async with TaskGroup() as socket_tasks:
                 socker = LeankSocketServer(leank_factory, socket_tasks)
