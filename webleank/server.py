@@ -15,20 +15,54 @@ from websockets.http11 import Request, Response
 
 from lspleanklib import (
     DuplexStream,
-    JsonRpcChannel,
     JsonRpcMsgStream,
     LeankLakeFactory,
     MethodCall,
     RpcChannel,
     RpcDirChannelFactory,
+    RpcMsgChannel,
     RpcSubprocessFactory,
     channel_lsp_server,
 )
 
-from .jsonrpc import WebSocketJsonRpcMsgConnection
+from .jsonrpc import websocket_rpc_channel
 
 
 log = logging.getLogger(__spec__.parent)
+
+
+LINGER_SECONDS = 5
+
+
+class WebleankCenter:
+    def __init__(self, factory: RpcDirChannelFactory):
+        self._factory = factory
+
+    async def linger(self) -> None:
+        log.debug(f"lingering {LINGER_SECONDS} seconds")
+        await asyncio.sleep(LINGER_SECONDS)
+
+    async def leank_socket_run(self, chan: RpcChannel) -> None:
+        try:
+            async with TaskGroup() as connection_tasks:
+                server = channel_lsp_server(
+                    self._factory, chan.proxy, connection_tasks
+                )
+                connection_tasks.create_task(chan.pump(server))
+        except Exception as ex:
+            log.exception(ex)
+        finally:
+            log.debug("socket finished")
+            await self.linger()
+
+    async def sidekick_websocket_run(self, chan: RpcChannel) -> None:
+        await chan.proxy.notify(MethodCall('ack'))
+        await chan.pump()
+        await self.linger()
+
+    async def control_websocket_run(self, chan: RpcChannel) -> None:
+        await chan.pump()
+        await self.linger()
 
 
 MIME_TYPES = {'.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript'}
@@ -66,7 +100,8 @@ class AllowedDomains:
 
 
 class LeankWebServer:
-    def __init__(self, domains: AllowedDomains) -> None:
+    def __init__(self, center: WebleankCenter, domains: AllowedDomains) -> None:
+        self._center = center
         self._webapp_files = load_webapp_files()
         self._domains = domains
         self._loop = asyncio.get_event_loop()
@@ -94,20 +129,22 @@ class LeankWebServer:
     async def _on_connect(self, websocket: ServerConnection) -> None:
         if websocket.request is None:
             return
-        if websocket.request.path != '/ws/sidekick':
-            return
         origin = websocket.request.headers.get("origin")
         if origin is None:
             log.error("Websocket connection missing origin HTTP header")
             return
         hostname = urlsplit(origin).hostname
-        conn = WebSocketJsonRpcMsgConnection(websocket, 'sidekick')
-        ws_chan = JsonRpcChannel(conn, self._loop)
-        if self._domains.is_allowed(hostname):
-            await ws_chan.proxy.notify(MethodCall('ack', hostname))
-        else:
+        ws_chan = websocket_rpc_channel(websocket, 'sidekick')
+        if not self._domains.is_allowed(hostname):
             log.error("Websocket connection origin domain not allowed")
             await ws_chan.proxy.notify(MethodCall('forbidden', hostname))
+        else:
+            match websocket.request.path:
+                case '/ws/sidekick':
+                    await self._center.sidekick_websocket_run(ws_chan)
+                case '/ws/control':
+                    await self._center.control_websocket_run(ws_chan)
+
 
     def _webapp_http_server(
         self, connection: ServerConnection, request: Request
@@ -123,41 +160,19 @@ class LeankWebServer:
         return None
 
 
-LINGER_SECONDS = 5
-
-
 class LeankSocketServer:
-    def __init__(self, factory: RpcDirChannelFactory, tg: TaskGroup):
-        self._factory = factory
+    def __init__(self, center: WebleankCenter, tg: TaskGroup):
+        self._center = center
         self._socket_tasks = tg
         self._loop = asyncio.get_running_loop()
-        self._staying_alive()
 
     def on_connect(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         log.debug("socket connected")
         aio = DuplexStream(reader, writer)
-        sock_chan = JsonRpcChannel(JsonRpcMsgStream(aio,'socket'), self._loop)
-        self._socket_tasks.create_task(self._async_on_connect(sock_chan))
-
-    async def _async_on_connect(self, sock_chan: RpcChannel) -> None:
-        try:
-            async with TaskGroup() as connection_tasks:
-                server = channel_lsp_server(
-                    self._factory, sock_chan.proxy, connection_tasks
-                )
-                connection_tasks.create_task(sock_chan.pump(server))
-        except Exception as ex:
-            log.exception(ex)
-        finally:
-            log.debug("socket finished")
-            self._staying_alive()
-
-    def _staying_alive(self) -> None:
-        # Ah, ah, ah, ah ... stayin' alive ... stayin' alive
-        log.debug(f"staying alive {LINGER_SECONDS} seconds")
-        self._socket_tasks.create_task(asyncio.sleep(LINGER_SECONDS))
+        sock_chan = RpcMsgChannel(JsonRpcMsgStream(aio,'socket'), self._loop)
+        self._socket_tasks.create_task(self._center.leank_socket_run(sock_chan))
 
 
 CONFIG_FILENAME = 'webleank.toml'
@@ -196,7 +211,8 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
     loop = asyncio.get_running_loop()
     lake_factory = RpcSubprocessFactory(lake_cmd, loop)
     leank_factory = LeankLakeFactory(lake_factory)
-    web_port_server = LeankWebServer(config.allowed_domains)
+    center = WebleankCenter(leank_factory)
+    web_port_server = LeankWebServer(center, config.allowed_domains)
     this_process_got_it = await web_port_server.bind_port(web_port)
     if not this_process_got_it:
         # assume another process is running as service
@@ -205,7 +221,8 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
         web_port_tasks.create_task(web_port_server.start_serving())
         try:
             async with TaskGroup() as socket_tasks:
-                socker = LeankSocketServer(leank_factory, socket_tasks)
+                socket_tasks.create_task(center.linger())
+                socker = LeankSocketServer(center, socket_tasks)
                 await asyncio.start_unix_server(socker.on_connect, sock_path)
                 log.info(f"listening on socket {sock_path}")
                 # will exit with-context when TaskGroup tasks complete

@@ -2,23 +2,28 @@
 JSON-RPC for WebSockets
 """
 
-import json, logging
+import asyncio, json, logging
 
 import websockets.exceptions
 from websockets.asyncio.connection import Connection
 
-from lspleanklib import JsonRpcMsg, JsonRpcMsgConnection
+from lspleanklib import (
+    JsonRpcMsg,
+    RpcChannel,
+    RpcMsgChannel,
+    RpcMsgConnection,
+)
 
 
 log = logging.getLogger(__spec__.parent)
 
 
-class WebSocketJsonRpcMsgConnection(JsonRpcMsgConnection):
+class WebSocketRpcMsgConnection(RpcMsgConnection):
     def __init__(self, conn: Connection, name: str):
         self._conn = conn
         self._name = name
 
-    async def close(self) -> None:
+    async def close_and_wait(self) -> None:
         await self._conn.close()
 
     async def write(self, msg: JsonRpcMsg) -> None:
@@ -45,3 +50,8 @@ class WebSocketJsonRpcMsgConnection(JsonRpcMsgConnection):
     @property
     def name(self) -> str:
         return self._name
+
+
+def websocket_rpc_channel(websocket: Connection, name: str) -> RpcChannel:
+    rpc_conn = WebSocketRpcMsgConnection(websocket, name)
+    return RpcMsgChannel(rpc_conn, asyncio.get_running_loop())
