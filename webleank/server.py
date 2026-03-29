@@ -1,8 +1,8 @@
 from __future__ import annotations
 import asyncio, errno, http, logging, os, tomli
 from asyncio import TaskGroup
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager, suppress
+from collections.abc import Sequence
+from contextlib import suppress
 from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -104,6 +104,7 @@ class LeankWebServer:
         self._domains = domains
         self._loop = asyncio.get_event_loop()
         self._server: websockets.asyncio.server.Server | None = None
+        self._tg: TaskGroup | None = None
 
     async def bind_port(self, web_port: int) -> bool:
         try:
@@ -122,7 +123,10 @@ class LeankWebServer:
 
     async def start_serving(self) -> None:
         assert self._server
-        await self._server.start_serving()
+        async with self._server:
+            async with TaskGroup() as self._tg:
+                await self._server.start_serving()
+                await self._center.linger()
 
     async def _on_connect(self, websocket: ServerConnection) -> None:
         if websocket.request is None:
@@ -137,12 +141,12 @@ class LeankWebServer:
             log.error("Websocket connection origin domain not allowed")
             await ws_chan.proxy.notify(MethodCall('forbidden', hostname))
         else:
+            assert self._tg
             match websocket.request.path:
                 case '/ws/sidekick':
-                    await self._center.sidekick_websocket_run(ws_chan)
+                    self._tg.create_task(self._center.sidekick_websocket_run(ws_chan))
                 case '/ws/control':
-                    await self._center.control_websocket_run(ws_chan)
-
+                    self._tg.create_task(self._center.control_websocket_run(ws_chan))
 
     def _webapp_http_server(
         self, connection: ServerConnection, request: Request
@@ -161,22 +165,23 @@ class LeankWebServer:
 class LeankSocketServer:
     def __init__(self, center: WebleankCenter):
         self._center = center
-        self._socket_tasks: TaskGroup | None = None
         self._loop = asyncio.get_running_loop()
+        self._tg: TaskGroup | None = None
 
-    @asynccontextmanager
-    async def start_serving(self, sock_path: Path) -> AsyncIterator[None]:
-        async with TaskGroup() as self._socket_tasks:
-            await asyncio.start_unix_server(self._on_connect, sock_path)
-            yield
+    async def start_serving(self, sock_path: Path) -> None:
+        srvr = await asyncio.start_unix_server(self._on_connect, sock_path, start_serving=False)
+        async with TaskGroup() as self._tg:
+            async with srvr:
+                await srvr.start_serving()
+                await self._center.linger()
 
     def _on_connect(
         self, ain: asyncio.StreamReader, aout: asyncio.StreamWriter
     ) -> None:
         log.debug("socket connected")
-        assert self._socket_tasks
+        assert self._tg
         sock_chan = json_rpc_channel(ain, aout, name='socket', loop=self._loop)
-        self._socket_tasks.create_task(self._center.leank_socket_run(sock_chan))
+        self._tg.create_task(self._center.leank_socket_run(sock_chan))
 
 
 CONFIG_FILENAME = 'webleank.toml'
@@ -222,14 +227,12 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
     if not this_process_got_it:
         # assume another process is running as service
         return False
-    async with TaskGroup() as web_port_tasks:
-        web_port_tasks.create_task(web_port_server.start_serving())
-        try:
-            async with socket_server.start_serving(sock_path):
-                log.info(f"listening on socket {sock_path}")
-                await center.linger()
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(sock_path)
-                log.debug(f"Deleted socket {sock_path}")
+    try:
+        async with TaskGroup() as tg:
+            tg.create_task(web_port_server.start_serving())
+            tg.create_task(socket_server.start_serving(sock_path))
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(sock_path)
+            log.debug(f"Deleted socket {sock_path}")
     return True
