@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, errno, http, logging, os, tomli
-from asyncio import TaskGroup
-from collections.abc import Sequence
+from asyncio import Event, TaskGroup
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from importlib import resources
 from pathlib import Path
@@ -29,38 +29,84 @@ from .jsonrpc import websocket_rpc_channel
 log = logging.getLogger(__spec__.parent)
 
 
+class LeankSession:
+    async def run(self, chan: RpcChannel, factory: RpcDirChannelFactory) -> None:
+        async with TaskGroup() as session_tasks:
+            server = channel_lsp_server(factory, chan.proxy, session_tasks)
+            session_tasks.create_task(chan.pump(server))
+
+
+class SidekickSession:
+    async def run(self, chan: RpcChannel) -> None:
+        await chan.proxy.notify(MethodCall('ack'))
+        await chan.pump()
+
+
 LINGER_SECONDS = 5
+
+
+class LifeSaver:
+    def __init__(self, life_needed: Callable[[], bool]) -> None:
+        self._life_needed = life_needed
+        self._expire_event = Event()
+        self._life_event = Event()
+        self._life_event.set()
+
+    async def wait_expired(self) -> None:
+        await self._expire_event.wait()
+
+    def on_life_event(self) -> None:
+        self._life_event.set()
+
+    async def stay_alive(self) -> None:
+        # Ah, ah, ah, ah ... stayin' alive ... stayin' alive
+        while await self._life_event.wait():
+            self._life_event.clear()
+            if not self._life_needed():
+                log.debug(f"Staying alive for {LINGER_SECONDS} seconds")
+                await asyncio.sleep(LINGER_SECONDS)
+            if not self._life_needed() and not self._life_event.is_set():
+                break
+        self._expire_event.set()
 
 
 class WebleankCenter:
     def __init__(self, factory: RpcDirChannelFactory):
         self._factory = factory
+        self._leanks: list[LeankSession] = []
+        self._sidekicks: list[SidekickSession] = []
+        self.life_saver = LifeSaver(self.has_sessions)
 
-    async def linger(self) -> None:
-        log.debug(f"lingering {LINGER_SECONDS} seconds")
-        await asyncio.sleep(LINGER_SECONDS)
+    def has_sessions(self) -> bool:
+        return bool(self._leanks) or bool(self._sidekicks)
 
     async def leank_socket_run(self, chan: RpcChannel) -> None:
+        sess = LeankSession()
+        self._leanks.append(sess)
         try:
-            async with TaskGroup() as connection_tasks:
-                server = channel_lsp_server(
-                    self._factory, chan.proxy, connection_tasks
-                )
-                connection_tasks.create_task(chan.pump(server))
-        except Exception as ex:
-            log.exception(ex)
+            await sess.run(chan, self._factory)
+        except Exception:
+            log.exception("Leank socket LSP server session exception")
         finally:
-            log.debug("socket finished")
-            await self.linger()
+            log.debug("leank socket finished")
+            self._leanks.remove(sess)
+            self.life_saver.on_life_event()
 
     async def sidekick_websocket_run(self, chan: RpcChannel) -> None:
-        await chan.proxy.notify(MethodCall('ack'))
-        await chan.pump()
-        await self.linger()
+        sess = SidekickSession()
+        self._sidekicks.append(sess)
+        try:
+            await sess.run(chan)
+        except Exception:
+            log.exception("Sidekick session exception")
+        finally:
+            log.debug("sidekick websocket finished")
+            self._sidekicks.remove(sess)
+            self.life_saver.on_life_event()
 
     async def control_websocket_run(self, chan: RpcChannel) -> None:
-        await chan.pump()
-        await self.linger()
+        # TODO something diff than sidekick
+        await self.sidekick_websocket_run(chan)
 
 
 MIME_TYPES = {'.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript'}
@@ -92,7 +138,7 @@ class AllowedDomains:
         if origin:
             parts = origin.split('.')
             for allowed in self._domains:
-                if parts[-len(allowed):] == allowed:
+                if parts[-len(allowed) :] == allowed:
                     return True
         return False
 
@@ -104,7 +150,6 @@ class LeankWebServer:
         self._domains = domains
         self._loop = asyncio.get_event_loop()
         self._server: websockets.asyncio.server.Server | None = None
-        self._tg: TaskGroup | None = None
 
     async def bind_port(self, web_port: int) -> bool:
         try:
@@ -122,11 +167,11 @@ class LeankWebServer:
         return True
 
     async def start_serving(self) -> None:
-        assert self._server
-        async with self._server:
-            async with TaskGroup() as self._tg:
+        if self._server is not None:
+            async with self._server:
                 await self._server.start_serving()
-                await self._center.linger()
+                await self._center.life_saver.wait_expired()
+            self._server = None
 
     async def _on_connect(self, websocket: ServerConnection) -> None:
         if websocket.request is None:
@@ -141,12 +186,11 @@ class LeankWebServer:
             log.error("Websocket connection origin domain not allowed")
             await ws_chan.proxy.notify(MethodCall('forbidden', hostname))
         else:
-            assert self._tg
             match websocket.request.path:
                 case '/ws/sidekick':
-                    self._tg.create_task(self._center.sidekick_websocket_run(ws_chan))
+                    await self._center.sidekick_websocket_run(ws_chan)
                 case '/ws/control':
-                    self._tg.create_task(self._center.control_websocket_run(ws_chan))
+                    await self._center.control_websocket_run(ws_chan)
 
     def _webapp_http_server(
         self, connection: ServerConnection, request: Request
@@ -166,22 +210,21 @@ class LeankSocketServer:
     def __init__(self, center: WebleankCenter):
         self._center = center
         self._loop = asyncio.get_running_loop()
-        self._tg: TaskGroup | None = None
 
     async def start_serving(self, sock_path: Path) -> None:
-        srvr = await asyncio.start_unix_server(self._on_connect, sock_path, start_serving=False)
-        async with TaskGroup() as self._tg:
-            async with srvr:
-                await srvr.start_serving()
-                await self._center.linger()
+        srvr = await asyncio.start_unix_server(
+            self._on_connect, sock_path, start_serving=False
+        )
+        async with srvr:
+            await srvr.start_serving()
+            await self._center.life_saver.wait_expired()
 
-    def _on_connect(
+    async def _on_connect(
         self, ain: asyncio.StreamReader, aout: asyncio.StreamWriter
     ) -> None:
         log.debug("socket connected")
-        assert self._tg
         sock_chan = json_rpc_channel(ain, aout, name='socket', loop=self._loop)
-        self._tg.create_task(self._center.leank_socket_run(sock_chan))
+        await self._center.leank_socket_run(sock_chan)
 
 
 CONFIG_FILENAME = 'webleank.toml'
@@ -194,7 +237,7 @@ def get_config_path() -> Path | None:
         try:
             default = resources.files(__package__).joinpath('config', CONFIG_FILENAME)
             os.makedirs(lean_config_dir)
-            with open(config_path , 'wb') as file:
+            with open(config_path, 'wb') as file:
                 file.write(default.read_bytes())
         except FileExistsError:
             pass
@@ -231,6 +274,7 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
         async with TaskGroup() as tg:
             tg.create_task(web_port_server.start_serving())
             tg.create_task(socket_server.start_serving(sock_path))
+            tg.create_task(center.life_saver.stay_alive())
     finally:
         with suppress(FileNotFoundError):
             os.unlink(sock_path)
