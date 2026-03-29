@@ -1,8 +1,8 @@
 from __future__ import annotations
 import asyncio, errno, http, logging, os, tomli
 from asyncio import TaskGroup
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager, suppress
 from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -14,15 +14,13 @@ from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
 
 from lspleanklib import (
-    DuplexStream,
-    JsonRpcMsgStream,
     LeankLakeFactory,
     MethodCall,
     RpcChannel,
     RpcDirChannelFactory,
-    RpcMsgChannel,
     RpcSubprocessFactory,
     channel_lsp_server,
+    json_rpc_channel,
 )
 
 from .jsonrpc import websocket_rpc_channel
@@ -161,17 +159,23 @@ class LeankWebServer:
 
 
 class LeankSocketServer:
-    def __init__(self, center: WebleankCenter, tg: TaskGroup):
+    def __init__(self, center: WebleankCenter):
         self._center = center
-        self._socket_tasks = tg
+        self._socket_tasks: TaskGroup | None = None
         self._loop = asyncio.get_running_loop()
 
-    def on_connect(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    @asynccontextmanager
+    async def start_serving(self, sock_path: Path) -> AsyncIterator[None]:
+        async with TaskGroup() as self._socket_tasks:
+            await asyncio.start_unix_server(self._on_connect, sock_path)
+            yield
+
+    def _on_connect(
+        self, ain: asyncio.StreamReader, aout: asyncio.StreamWriter
     ) -> None:
         log.debug("socket connected")
-        aio = DuplexStream(reader, writer)
-        sock_chan = RpcMsgChannel(JsonRpcMsgStream(aio,'socket'), self._loop)
+        assert self._socket_tasks
+        sock_chan = json_rpc_channel(ain, aout, name='socket', loop=self._loop)
         self._socket_tasks.create_task(self._center.leank_socket_run(sock_chan))
 
 
@@ -209,9 +213,10 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
     config = Config()
     lake_cmd = ['lake', 'serve']
     loop = asyncio.get_running_loop()
-    lake_factory = RpcSubprocessFactory(lake_cmd, loop)
+    lake_factory = RpcSubprocessFactory(lake_cmd, loop=loop)
     leank_factory = LeankLakeFactory(lake_factory)
     center = WebleankCenter(leank_factory)
+    socket_server = LeankSocketServer(center)
     web_port_server = LeankWebServer(center, config.allowed_domains)
     this_process_got_it = await web_port_server.bind_port(web_port)
     if not this_process_got_it:
@@ -220,13 +225,11 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
     async with TaskGroup() as web_port_tasks:
         web_port_tasks.create_task(web_port_server.start_serving())
         try:
-            async with TaskGroup() as socket_tasks:
-                socket_tasks.create_task(center.linger())
-                socker = LeankSocketServer(center, socket_tasks)
-                await asyncio.start_unix_server(socker.on_connect, sock_path)
+            async with socket_server.start_serving(sock_path):
                 log.info(f"listening on socket {sock_path}")
-                # will exit with-context when TaskGroup tasks complete
+                await center.linger()
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(sock_path)
+                log.debug(f"Deleted socket {sock_path}")
     return True

@@ -19,9 +19,8 @@ log = logging.getLogger(__spec__.parent)
 
 
 class WebSocketRpcMsgConnection(RpcMsgConnection):
-    def __init__(self, conn: Connection, name: str):
+    def __init__(self, conn: Connection):
         self._conn = conn
-        self._name = name
 
     async def close_and_wait(self) -> None:
         await self._conn.close()
@@ -31,7 +30,7 @@ class WebSocketRpcMsgConnection(RpcMsgConnection):
         try:
             await self._conn.send(text)
         except websockets.exceptions.ConnectionClosed as ex:
-            raise RuntimeError(f"WebSocket {self.name} connection closed") from ex
+            raise RuntimeError("WebSocket connection closed") from ex
 
     async def read(self) -> JsonRpcMsg | None:
         while True:
@@ -44,14 +43,9 @@ class WebSocketRpcMsgConnection(RpcMsgConnection):
             try:
                 return JsonRpcMsg.from_jsonrpc(json.loads(data))
             except ValueError:
-                err = "Bad JSON-RPC messsage on WebSocket '{}'"
-                log.exception(err.format(self.name))
-
-    @property
-    def name(self) -> str:
-        return self._name
+                log.exception("Bad JSON-RPC messsage on WebSocket")
 
 
 def websocket_rpc_channel(websocket: Connection, name: str) -> RpcChannel:
-    rpc_conn = WebSocketRpcMsgConnection(websocket, name)
-    return RpcMsgChannel(rpc_conn, asyncio.get_running_loop())
+    rpc_conn = WebSocketRpcMsgConnection(websocket)
+    return RpcMsgChannel(rpc_conn, name='websocket', loop=asyncio.get_running_loop())
