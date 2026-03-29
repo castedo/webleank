@@ -1,7 +1,7 @@
 from __future__ import annotations
-import asyncio, errno, http, logging, os, tomli
+import asyncio, errno, http, os, tomli
 from asyncio import Event, TaskGroup
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from importlib import resources
 from pathlib import Path
@@ -9,31 +9,103 @@ from urllib.parse import urlsplit
 
 from platformdirs import user_config_path
 import websockets.asyncio.server
+from websockets import http11
 from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
-from websockets.http11 import Request, Response
 
 from lspleanklib import (
-    LeankLakeFactory,
+    ErrorCode,
+    LspAny,
     MethodCall,
+    Response,
     RpcChannel,
     RpcDirChannelFactory,
+    RpcInterface,
     RpcSubprocessFactory,
+    awaitable_error,
     channel_lsp_server,
     json_rpc_channel,
 )
 
 from .jsonrpc import websocket_rpc_channel
+from .util import awaitable, get_obj, get_str, log, version
 
 
-log = logging.getLogger(__spec__.parent)
+LSP_CLIENT_NAME = "webleank"
+LSP_SERVER_NAME = "webleank"
+
+
+def leank_init_response(lake_init_response: Response) -> Response:
+    if lake_init_response.error is not None:
+        return lake_init_response
+    return Response(
+        {
+            # TODO check and standardize server caps
+            'capabilities': get_obj(lake_init_response.result, 'capabilities'),
+            'serverInfo': {'name': LSP_SERVER_NAME, 'version': version()},
+        }
+    )
+
+
+class LakeClient(RpcInterface):
+    def __init__(self, leank_client: RpcInterface):
+        self.client = leank_client
+
+    async def close_and_wait(self) -> None:
+        await self.client.close_and_wait()
+
+    async def notify(self, mc: MethodCall) -> None:
+        await self.client.notify(mc)
+
+    async def request(
+        self, mc: MethodCall, fix_id: str | None = None
+    ) -> Awaitable[Response]:
+        if mc.method == "client/registerCapability":
+            return awaitable_error(ErrorCode.MethodNotFound)
+        return await self.client.request(mc, fix_id)
+
+
+def initialize_call(leank_params: LspAny) -> MethodCall:
+    return MethodCall(
+        'initialize',
+        {
+            'capabilities': get_obj(leank_params, 'capabilities'),
+            'clientInfo': {'name': LSP_CLIENT_NAME, 'version': version()},
+            'processId': os.getpid(),
+            'rootUri': get_str(leank_params, 'rootUri'),
+        },
+    )
+
+
+class LeankServer(RpcInterface):
+    def __init__(self, lake_server: RpcInterface):
+        self._lake_server = lake_server
+
+    async def close_and_wait(self) -> None:
+        await self._lake_server.close_and_wait()
+
+    async def notify(self, mc: MethodCall) -> None:
+        await self._lake_server.notify(mc)
+
+    async def request(
+        self, mc: MethodCall, fix_id: str | None = None
+    ) -> Awaitable[Response]:
+        if mc.method != "initialized":
+            return await self._lake_server.request(mc)
+        else:
+            aw_response = await self._lake_server.request(initialize_call(mc.params))
+            response = await aw_response
+            return awaitable(leank_init_response(response))
 
 
 class LeankSession:
-    async def run(self, chan: RpcChannel, factory: RpcDirChannelFactory) -> None:
+    async def run(self, chan: RpcChannel, lake_factory: RpcDirChannelFactory) -> None:
         async with TaskGroup() as session_tasks:
-            server = channel_lsp_server(factory, chan.proxy, session_tasks)
-            session_tasks.create_task(chan.pump(server))
+            leank_client = chan.proxy
+            lake_client = LakeClient(leank_client)
+            lake_server = channel_lsp_server(lake_factory, lake_client, session_tasks)
+            leank_server = LeankServer(lake_server)
+            session_tasks.create_task(chan.pump(leank_server))
 
 
 class SidekickSession:
@@ -71,8 +143,8 @@ class LifeSaver:
 
 
 class WebleankCenter:
-    def __init__(self, factory: RpcDirChannelFactory):
-        self._factory = factory
+    def __init__(self, lake_factory: RpcDirChannelFactory):
+        self._lake_factory = lake_factory
         self._leanks: list[LeankSession] = []
         self._sidekicks: list[SidekickSession] = []
         self.life_saver = LifeSaver(self.has_sessions)
@@ -84,7 +156,7 @@ class WebleankCenter:
         sess = LeankSession()
         self._leanks.append(sess)
         try:
-            await sess.run(chan, self._factory)
+            await sess.run(chan, self._lake_factory)
         except Exception:
             log.exception("Leank socket LSP server session exception")
         finally:
@@ -112,13 +184,13 @@ class WebleankCenter:
 MIME_TYPES = {'.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript'}
 
 
-def make_file_response(path: str | Path, content: bytes) -> Response:
+def make_file_response(path: str | Path, content: bytes) -> http11.Response:
     mime_type = MIME_TYPES.get(Path(path).suffix)
     headers = Headers()
     headers['Content-Length'] = str(len(content))
     if mime_type is not None:
         headers['Content-Type'] = mime_type
-    return Response(http.HTTPStatus.OK, 'OK', headers, content)
+    return http11.Response(http.HTTPStatus.OK, 'OK', headers, content)
 
 
 def load_webapp_files() -> dict[str, bytes]:
@@ -193,8 +265,8 @@ class LeankWebServer:
                     await self._center.control_websocket_run(ws_chan)
 
     def _webapp_http_server(
-        self, connection: ServerConnection, request: Request
-    ) -> Response | None:
+        self, connection: ServerConnection, request: http11.Request
+    ) -> http11.Response | None:
         path = request.path
         if path == '/':
             path = '/index.html'
@@ -262,8 +334,7 @@ async def run_service(web_port: int, sock_path: Path) -> bool:
     lake_cmd = ['lake', 'serve']
     loop = asyncio.get_running_loop()
     lake_factory = RpcSubprocessFactory(lake_cmd, loop=loop)
-    leank_factory = LeankLakeFactory(lake_factory)
-    center = WebleankCenter(leank_factory)
+    center = WebleankCenter(lake_factory)
     socket_server = LeankSocketServer(center)
     web_port_server = LeankWebServer(center, config.allowed_domains)
     this_process_got_it = await web_port_server.bind_port(web_port)

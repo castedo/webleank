@@ -6,7 +6,8 @@ import argparse, asyncio, logging, socket, subprocess, sys
 from pathlib import Path
 from typing import Any
 
-from .server import run_service, log
+from .server import run_service
+from .util import log, version
 
 from lspleanklib import get_user_socket_path, lspleank_connect_main
 
@@ -63,15 +64,6 @@ async def service_amain(web_port: int) -> int:
         log.exception(ex)
         return 1
     return 0
-
-
-def version() -> str:
-    try:
-        from ._version import version  # type: ignore[import-not-found, import-untyped, unused-ignore]
-
-        return str(version)
-    except ImportError:
-        return '0.0.0'
 
 
 PROG_NAME = "webleank"
