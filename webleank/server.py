@@ -37,6 +37,14 @@ class VirtualEditor:
         self._doc_highlight: list[LspObject] | None = None
         self._sidekicks: list[SidekickSession] = []
 
+    async def run(self, chan: RpcChannel, lake_factory: RpcDirChannelFactory) -> None:
+        async with TaskGroup() as session_tasks:
+            leank_client = chan.proxy
+            lake_client = LakeClient(leank_client, self)
+            lake_server = channel_lsp_server(lake_factory, lake_client, session_tasks)
+            leank_server = LeankServer(lake_server, self)
+            session_tasks.create_task(chan.pump(leank_server))
+
     async def on_notify_from_lake(self, mc: MethodCall) -> None:
         if mc.method == '$/lean/fileProgress':
             for s in self._sidekicks:
@@ -70,6 +78,7 @@ class SidekickSession:
     async def run(self) -> None:
         await self._channel.proxy.notify(MethodCall('ack'))
         await self._channel.pump()
+        self._server_api = None
         if self._veditor:
             self._veditor.deattach(self)
             self._veditor = None
@@ -164,19 +173,6 @@ class LeankServer(RpcInterface):
             return await self._lake_server.request(mc)
 
 
-class LeankSession:
-    def __init__(self) -> None:
-        self.veditor = VirtualEditor()
-
-    async def run(self, chan: RpcChannel, lake_factory: RpcDirChannelFactory) -> None:
-        async with TaskGroup() as session_tasks:
-            leank_client = chan.proxy
-            lake_client = LakeClient(leank_client, self.veditor)
-            lake_server = channel_lsp_server(lake_factory, lake_client, session_tasks)
-            leank_server = LeankServer(lake_server, self.veditor)
-            session_tasks.create_task(chan.pump(leank_server))
-
-
 LINGER_SECONDS = 5
 
 
@@ -208,37 +204,37 @@ class LifeSaver:
 class WebleankCenter:
     def __init__(self, lake_factory: RpcDirChannelFactory):
         self._lake_factory = lake_factory
-        self._leanks: list[LeankSession] = []
+        self._veditors: list[VirtualEditor] = []
         self._sidekicks: list[SidekickSession] = []
         self.life_saver = LifeSaver(self.has_sessions)
 
     def has_sessions(self) -> bool:
-        return bool(self._leanks) or bool(self._sidekicks)
+        return bool(self._veditors) or bool(self._sidekicks)
 
     async def on_new_active_veditor(self, new: VirtualEditor) -> None:
         for s in self._sidekicks:
             await s.on_new_active_veditor(new)
 
     async def leank_socket_run(self, chan: RpcChannel) -> None:
-        sess = LeankSession()
-        self._leanks.append(sess)
-        if len(self._leanks) == 1:
-            await self.on_new_active_veditor(sess.veditor)
+        ved = VirtualEditor()
+        self._veditors.append(ved)
+        if len(self._veditors) == 1:
+            await self.on_new_active_veditor(ved)
         try:
-            await sess.run(chan, self._lake_factory)
+            await ved.run(chan, self._lake_factory)
         except Exception:
             log.exception("Leank socket LSP server session exception")
-        active_veditor_change = (sess == self._leanks[0])
-        self._leanks.remove(sess)
-        if active_veditor_change and len(self._leanks):
-            await self.on_new_active_veditor(self._leanks[0].veditor)
+        active_veditor_change = (ved== self._veditors[0])
+        self._veditors.remove(ved)
+        if active_veditor_change and len(self._veditors):
+            await self.on_new_active_veditor(self._veditors[0])
         self.life_saver.on_life_event()
 
     async def sidekick_websocket_run(self, chan: RpcChannel) -> None:
         sess = SidekickSession(chan)
         self._sidekicks.append(sess)
-        if len(self._leanks):
-            await sess.on_new_active_veditor(self._leanks[0].veditor)
+        if len(self._veditors):
+            await sess.on_new_active_veditor(self._veditors[0])
         try:
             await sess.run()
         except Exception:
@@ -397,13 +393,13 @@ class Config:
                 data = tomllib.load(file)
             domains = data.get('allowed', {}).get('domains', [])
         self.allowed_domains = AllowedDomains(domains)
+        self.lake_cmd = data.get('lake', {}).get('cmd', ['lake', 'serve'])
 
 
 async def run_service(web_port: int, sock_path: Path) -> bool:
     config = Config()
-    lake_cmd = ['lake', 'serve']
     loop = asyncio.get_running_loop()
-    lake_factory = RpcSubprocessFactory(lake_cmd, loop=loop)
+    lake_factory = RpcSubprocessFactory(config.lake_cmd, loop=loop)
     center = WebleankCenter(lake_factory)
     socket_server = LeankSocketServer(center)
     web_port_server = LeankWebServer(center, config.allowed_domains)
