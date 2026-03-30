@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, errno, http, os, tomli
+import asyncio, errno, http, os, tomllib
 from asyncio import Event, TaskGroup
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -394,7 +394,7 @@ class Config:
             domains = []
         else:
             with open(path, 'rb') as file:
-                data = tomli.load(file)
+                data = tomllib.load(file)
             domains = data.get('allowed', {}).get('domains', [])
         self.allowed_domains = AllowedDomains(domains)
 

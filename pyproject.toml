@@ -7,9 +7,8 @@ name = "webleank"
 dynamic = ["version"]
 description = "Link Lean sidekick web apps to LSP-enabled editors"
 authors = [{name = "Castedo Ellerman", email = "castedo@castedo.com"}]
-license = "MIT"
-license-files = ["LICENSE"]
-requires-python = ">=3.11"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX",
@@ -17,7 +16,7 @@ classifiers = [
 keywords = ["lean", "lsp", "language-server-protocol"]
 dependencies = [
     "platformdirs",
-    "websockets",
+    "websockets>=14.2",
 ]
 
 [project.scripts]
