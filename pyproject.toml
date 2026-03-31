@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "webleank"
 dynamic = ["version"]
 description = "Link Lean sidekick web apps to LSP-enabled editors"
+readme = "README.md"
 authors = [{name = "Castedo Ellerman", email = "castedo@castedo.com"}]
 license = {file = "LICENSE"}
 requires-python = ">=3.12"
@@ -15,7 +16,7 @@ classifiers = [
 ]
 keywords = ["lean", "lsp", "language-server-protocol"]
 dependencies = [
-    "lspleanklib",
+    "lspleanklib>=0.2",
     "platformdirs",
     "websockets>=14.2",
 ]

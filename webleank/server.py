@@ -96,7 +96,7 @@ class SidekickSession(RpcInterface):
             self._veditor = None
 
     async def close_and_wait(self) -> None:
-        pass
+        await self._channel.proxy.close_and_wait()
 
     async def notify(self, mc: MethodCall) -> None:
         pass
