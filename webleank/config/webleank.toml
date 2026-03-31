@@ -1,2 +1,2 @@
 [allowed]
-domains = ['localhost', 'castedo.com']
+domains = ['127.0.0.1', 'localhost', 'castedo.com']

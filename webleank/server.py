@@ -16,8 +16,8 @@ from websockets.datastructures import Headers
 from lspleanklib import (
     ErrorCode,
     LspAny,
-    LspObject,
     MethodCall,
+    MsgParams,
     Response,
     RpcChannel,
     RpcDirChannelFactory,
@@ -34,32 +34,38 @@ from .util import awaitable, get_obj, get_str, log, version
 
 class VirtualEditor:
     def __init__(self) -> None:
-        self._doc_highlight: list[LspObject] | None = None
+        self._doc_highlight: MsgParams | None = None
         self._sidekicks: list[SidekickSession] = []
+        self.lake_server: RpcInterface | None = None
 
     async def run(self, chan: RpcChannel, lake_factory: RpcDirChannelFactory) -> None:
         async with TaskGroup() as session_tasks:
             leank_client = chan.proxy
             lake_client = LakeClient(leank_client, self)
-            lake_server = channel_lsp_server(lake_factory, lake_client, session_tasks)
-            leank_server = LeankServer(lake_server, self)
-            session_tasks.create_task(chan.pump(leank_server))
+            self.lake_server = channel_lsp_server(
+                lake_factory, lake_client, session_tasks
+            )
+            leank_server = LeankServer(self.lake_server, self)
+            await chan.pump(leank_server)
+        self.lake_server = None
 
     async def on_notify_from_lake(self, mc: MethodCall) -> None:
         if mc.method == '$/lean/fileProgress':
             for s in self._sidekicks:
-                await s.notify(mc)
+                await s.notify_sidekick(mc)
 
-    async def on_doc_highlight(self, result: LspAny) -> None:
-        self._doc_highlight = result if isinstance(result, list) else None
+    async def on_doc_highlight(self, params: MsgParams) -> None:
+        self._doc_highlight = params
         if self._doc_highlight is not None:
             for s in self._sidekicks:
-                await s.notify(MethodCall('documentHighlight', self._doc_highlight))
+                mc = MethodCall('documentHighlight', self._doc_highlight)
+                await s.notify_sidekick(mc)
 
     async def attach(self, sidekick: SidekickSession) -> None:
         self._sidekicks.append(sidekick)
         if self._doc_highlight is not None:
-            await sidekick.notify(MethodCall('documentHighlight', self._doc_highlight))
+            mc = MethodCall('documentHighlight', self._doc_highlight)
+            await sidekick.notify_sidekick(mc)
 
     def deattach(self, sidekick: SidekickSession) -> None:
         self._sidekicks.remove(sidekick)
@@ -70,18 +76,42 @@ class VirtualEditor:
             s.veditor_close()
 
 
-class SidekickSession:
+SIDEKICK_SERVER_API_REQUEST_METHODS = {
+    '$/lean/plainGoal',
+    '$/lean/plainTermGoal',
+}
+
+
+class SidekickSession(RpcInterface):
     def __init__(self, channel: RpcChannel) -> None:
         self._veditor: VirtualEditor | None = None
         self._channel = channel
 
     async def run(self) -> None:
         await self._channel.proxy.notify(MethodCall('ack'))
-        await self._channel.pump()
+        await self._channel.pump(self)
         self._server_api = None
         if self._veditor:
             self._veditor.deattach(self)
             self._veditor = None
+
+    async def close_and_wait(self) -> None:
+        pass
+
+    async def notify(self, mc: MethodCall) -> None:
+        pass
+
+    async def request(
+        self, mc: MethodCall, fix_id: str | None = None
+    ) -> Awaitable[Response]:
+        if (
+            self._veditor
+            and self._veditor.lake_server
+            and mc.method in SIDEKICK_SERVER_API_REQUEST_METHODS
+        ):
+            return await self._veditor.lake_server.request(mc, fix_id)
+        else:
+            return awaitable_error(ErrorCode.MethodNotFound)
 
     async def on_new_active_veditor(self, new: VirtualEditor) -> None:
         self._veditor = new
@@ -91,7 +121,7 @@ class SidekickSession:
     def veditor_close(self) -> None:
         self._veditor = None
 
-    async def notify(self, mc: MethodCall) -> None:
+    async def notify_sidekick(self, mc: MethodCall) -> None:
         await self._channel.proxy.notify(mc)
 
 
@@ -165,10 +195,9 @@ class LeankServer(RpcInterface):
             return awaitable(leank_init_response(response))
         elif mc.method == "textDocument/documentHighlight":
             aw_response = await self._lake_server.request(mc)
-            response = await aw_response
-            if response.error is None:
-                await self._veditor.on_doc_highlight(response.result)
-            return awaitable(response)
+            if mc.params is not None:
+                await self._veditor.on_doc_highlight(mc.params)
+            return aw_response
         else:
             return await self._lake_server.request(mc)
 
@@ -224,7 +253,7 @@ class WebleankCenter:
             await ved.run(chan, self._lake_factory)
         except Exception:
             log.exception("Leank socket LSP server session exception")
-        active_veditor_change = (ved== self._veditors[0])
+        active_veditor_change = bool(ved == self._veditors[0])
         self._veditors.remove(ved)
         if active_veditor_change and len(self._veditors):
             await self.on_new_active_veditor(self._veditors[0])
