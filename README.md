@@ -1,4 +1,4 @@
-webleank
+Webleank
 ========
 
 This repository is online at both:
@@ -11,11 +11,35 @@ Webleank implements WebSocket and web application functionality on top of the co
 functionality of [lspleanklib](https://gitlab.com/castedo/lspleanklib).
 
 
-For user guide and background information,
+For the user guide and background information,
 visit [lean.castedo.com/webleank](https://lean.castedo.com/webleank).
 
 
-CLI Reference
+Configuration reference
+-----------------------
+
+Webleank stores and reads its configuration from a file named `webleank.toml`, located in a `lean`
+subdirectory within the user configuration directory.
+For the exact file location, see the [Platform directories
+reference](#platform-directories-reference) section.
+
+The default `webleank.toml` configuration file is:
+```
+[allowed]
+domains = ['127.0.0.1', 'localhost', 'castedo.com']
+```
+
+The first time `webleank service` runs, it checks whether the `lean` configuration
+subdirectory exists. If it does not, it will write this default `webleank.toml`
+file.
+
+The `allowed.domains` setting specifies under which domains web-based *Lean editor
+sidekick* applications are allowed to connect to the `localhost:1342` WebSocket.
+
+For more information on the TOML format, visit [toml.io](https://toml.io).
+
+
+CLI reference
 -------------
 
 The `webleank` program provides functionality for web-based Lean editor
@@ -78,3 +102,21 @@ Running this command alone will not cause Webleank to run in the background. Run
 `webleank start` will cause this process to run in the background as a detached process.
 By default, `webleank service` will terminate after a number of idle seconds if nothing connects
 to one of the sockets it is servicing.
+
+
+Platform directories reference
+------------------------------
+
+Webleank creates a `lean` subdirectory in:
+
+* the user configuration directory, and
+* the user runtime directory.
+
+Webleank uses the [platformdirs Python package](https://platformdirs.readthedocs.io) to
+determine their platform-specific file system locations.
+On Linux, these correspond to `XDG_CONFIG_HOME` (default `~/.config`) and
+`XDG_RUNTIME_DIR`, respectively.
+On macOS, they correspond to `~/Library/Application Support/` and
+`~/Library/Caches/TemporaryItems/`, respectively.
+For other operating systems, consult the [platformdirs
+documentation](https://platformdirs.readthedocs.io/en/latest/platforms.html).

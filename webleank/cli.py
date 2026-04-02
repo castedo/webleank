@@ -81,7 +81,7 @@ def main(cmd_line_args: list[str] | None = None) -> int:
 
     cli = argparse.ArgumentParser(prog=PROG_NAME, description=__doc__)
     cli.add_argument('--version', action='version', version=version())
-    sub = cli.add_subparsers(dest='subcmd')
+    sub = cli.add_subparsers(dest='subcmd', required=True)
 
     sub.add_parser(
         'connect',
