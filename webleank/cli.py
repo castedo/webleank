@@ -1,5 +1,5 @@
 '''
-Link Lean sideick web apps to LSP-enabled editors
+Link Lean sidekick web apps to LSP-enabled editors
 '''
 
 import argparse, asyncio, logging, socket, subprocess, sys
@@ -81,15 +81,31 @@ def main(cmd_line_args: list[str] | None = None) -> int:
 
     cli = argparse.ArgumentParser(prog=PROG_NAME, description=__doc__)
     cli.add_argument('--version', action='version', version=version())
-    cli.add_argument('command', choices=['connect', 'start', 'service'])
-    cli.add_argument(
+    sub = cli.add_subparsers(dest='subcmd')
+
+    sub.add_parser(
+        'connect',
+        help='run as stdio LSP server connecting to lspleank socket',
+    )
+
+    sub.add_parser(
+        'start',
+        help='start webleank service as detached background process',
+    )
+
+    service = sub.add_parser(
+        'service',
+        help='run as webleank service process',
+    )
+    service.add_argument(
         '--web-port',
         type=int,
         default=1342,
         help='port for websockets and control panel web app',
     )
+
     args = cli.parse_args()
-    match args.command:
+    match args.subcmd:
         case 'connect':
             start_cmd = [sys.executable, '-m', PROG_NAME, 'start']
             return lspleank_connect_main(start_cmd)
