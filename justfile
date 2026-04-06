@@ -6,6 +6,11 @@ default:
 test:
     ruff check webleank || true
     mypy --strict webleank
+    mypy tests --cache-dir tests/.mypy_cache
+    pytest -vv tests --timeout=2 \
+#      -m 'not slow' \
+#      --durations=3 \
+#      --log-cli-level=DEBUG \
 
 build:
   cd webapp && npm install && npm run build

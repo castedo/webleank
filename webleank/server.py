@@ -202,15 +202,13 @@ class LeankServer(RpcInterface):
             return await self._lake_server.request(mc)
 
 
-LINGER_SECONDS = 5
-
-
 class LifeSaver:
-    def __init__(self, life_needed: Callable[[], bool]) -> None:
+    def __init__(self, life_needed: Callable[[], bool], *, linger_secs: float) -> None:
         self._life_needed = life_needed
         self._expire_event = Event()
         self._life_event = Event()
         self._life_event.set()
+        self._linger_secs = linger_secs
 
     async def wait_expired(self) -> None:
         await self._expire_event.wait()
@@ -223,19 +221,19 @@ class LifeSaver:
         while await self._life_event.wait():
             self._life_event.clear()
             if not self._life_needed():
-                log.debug(f"Staying alive for {LINGER_SECONDS} seconds")
-                await asyncio.sleep(LINGER_SECONDS)
+                log.debug(f"Staying alive for {self._linger_secs} seconds")
+                await asyncio.sleep(self._linger_secs)
             if not self._life_needed() and not self._life_event.is_set():
                 break
         self._expire_event.set()
 
 
 class WebleankCenter:
-    def __init__(self, lake_factory: RpcDirChannelFactory):
+    def __init__(self, lake_factory: RpcDirChannelFactory, *, linger_secs: float):
         self._lake_factory = lake_factory
         self._veditors: list[VirtualEditor] = []
         self._sidekicks: list[SidekickSession] = []
-        self.life_saver = LifeSaver(self.has_sessions)
+        self.life_saver = LifeSaver(self.has_sessions, linger_secs=linger_secs)
 
     def has_sessions(self) -> bool:
         return bool(self._veditors) or bool(self._sidekicks)
@@ -425,11 +423,11 @@ class Config:
         self.lake_cmd = data.get('lake', {}).get('cmd', ['lake', 'serve'])
 
 
-async def run_service(web_port: int, sock_path: Path) -> bool:
+async def run_service(web_port: int, sock_path: Path, *, linger_secs: float) -> bool:
     config = Config()
     loop = asyncio.get_running_loop()
     lake_factory = RpcSubprocessFactory(config.lake_cmd, loop=loop)
-    center = WebleankCenter(lake_factory)
+    center = WebleankCenter(lake_factory, linger_secs=linger_secs)
     socket_server = LeankSocketServer(center)
     web_port_server = LeankWebServer(center, config.allowed_domains)
     this_process_got_it = await web_port_server.bind_port(web_port)

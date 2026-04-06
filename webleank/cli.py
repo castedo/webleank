@@ -51,10 +51,13 @@ def start_main() -> int:
     return 0 if ok else 1
 
 
+LINGER_SECONDS = 5
+
+
 async def service_amain(web_port: int) -> int:
     try:
         sock_path = get_user_socket_path()
-        started = await run_service(web_port, sock_path)
+        started = await run_service(web_port, sock_path, linger_secs=LINGER_SECONDS)
         if not started:
             other_process_got_it = await socket_available(sock_path)
             if not other_process_got_it:
