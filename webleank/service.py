@@ -14,6 +14,8 @@ from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
 
 from lspleanklib import (
+    AsyncProgram,
+    DuplexStream,
     ErrorCode,
     LspAny,
     MethodCall,
@@ -203,37 +205,34 @@ class LeankServer(RpcInterface):
 
 
 class LifeSaver:
-    def __init__(self, life_needed: Callable[[], bool], *, linger_secs: float) -> None:
-        self._life_needed = life_needed
-        self._expire_event = Event()
+    def __init__(self) -> None:
+        self.expire_event = Event()
         self._life_event = Event()
         self._life_event.set()
-        self._linger_secs = linger_secs
-
-    async def wait_expired(self) -> None:
-        await self._expire_event.wait()
 
     def on_life_event(self) -> None:
         self._life_event.set()
 
-    async def stay_alive(self) -> None:
+    async def stay_alive(
+        self, life_needed: Callable[[], bool], linger_secs: float
+    ) -> None:
         # Ah, ah, ah, ah ... stayin' alive ... stayin' alive
         while await self._life_event.wait():
             self._life_event.clear()
-            if not self._life_needed():
-                log.debug(f"Staying alive for {self._linger_secs} seconds")
-                await asyncio.sleep(self._linger_secs)
-            if not self._life_needed() and not self._life_event.is_set():
+            if not life_needed():
+                log.debug(f"Staying alive for {linger_secs} seconds")
+                await asyncio.sleep(linger_secs)
+            if not life_needed() and not self._life_event.is_set():
                 break
-        self._expire_event.set()
+        self.expire_event.set()
 
 
 class WebleankCenter:
-    def __init__(self, lake_factory: RpcDirChannelFactory, *, linger_secs: float):
+    def __init__(self, lake_factory: RpcDirChannelFactory, life_saver: LifeSaver):
         self._lake_factory = lake_factory
+        self.life_saver = life_saver
         self._veditors: list[VirtualEditor] = []
         self._sidekicks: list[SidekickSession] = []
-        self.life_saver = LifeSaver(self.has_sessions, linger_secs=linger_secs)
 
     def has_sessions(self) -> bool:
         return bool(self._veditors) or bool(self._sidekicks)
@@ -335,7 +334,7 @@ class LeankWebServer:
         if self._server is not None:
             async with self._server:
                 await self._server.start_serving()
-                await self._center.life_saver.wait_expired()
+                await self._center.life_saver.expire_event.wait()
             self._server = None
 
     async def _on_connect(self, websocket: ServerConnection) -> None:
@@ -382,7 +381,7 @@ class LeankSocketServer:
         )
         async with srvr:
             await srvr.start_serving()
-            await self._center.life_saver.wait_expired()
+            await self._center.life_saver.expire_event.wait()
 
     async def _on_connect(
         self, ain: asyncio.StreamReader, aout: asyncio.StreamWriter
@@ -423,24 +422,77 @@ class Config:
         self.lake_cmd = data.get('lake', {}).get('cmd', ['lake', 'serve'])
 
 
-async def run_service(web_port: int, sock_path: Path, *, linger_secs: float) -> bool:
-    config = Config()
-    loop = asyncio.get_running_loop()
-    lake_factory = RpcSubprocessFactory(config.lake_cmd, loop=loop)
-    center = WebleankCenter(lake_factory, linger_secs=linger_secs)
-    socket_server = LeankSocketServer(center)
-    web_port_server = LeankWebServer(center, config.allowed_domains)
-    this_process_got_it = await web_port_server.bind_port(web_port)
-    if not this_process_got_it:
-        # assume another process is running as service
-        return False
-    try:
-        async with TaskGroup() as tg:
-            tg.create_task(web_port_server.start_serving())
-            tg.create_task(socket_server.start_serving(sock_path))
-            tg.create_task(center.life_saver.stay_alive())
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(sock_path)
-            log.debug(f"Deleted socket {sock_path}")
-    return True
+async def socket_available(
+    sock_path: Path, *, loop: asyncio.AbstractEventLoop | None = None
+) -> bool:
+    if loop is None:
+        loop = asyncio.get_running_loop()
+    for i in range(8):
+        try:
+            await asyncio.open_unix_connection(sock_path, loop=loop)
+            return True
+        except (FileNotFoundError, ConnectionRefusedError):
+            await asyncio.sleep(0.125)
+    return False
+
+
+LINGER_SECONDS = 5
+
+
+class ServiceProgram(AsyncProgram):
+    def __init__(self, web_port: int, sock_path: Path):
+        self._web_port = web_port
+        self._sock_path = sock_path
+        self._stdin_eof_event = Event()
+
+    async def amain(
+        self, stdio: DuplexStream, *, loop: asyncio.AbstractEventLoop
+    ) -> int:
+        try:
+            started = await self.run_service(linger_secs=LINGER_SECONDS, loop=loop)
+            if not started:
+                other_proc_got_it = await socket_available(self._sock_path, loop=loop)
+                if not other_proc_got_it:
+                    log.error(f"Unable to start server for {self._sock_path}")
+                return 0 if other_proc_got_it else 1
+        except Exception as ex:
+            log.exception(ex)
+            return 1
+        return 0
+
+    def on_stdin_eof(self) -> None:
+        self._stdin_eof_event.set()
+
+    async def run_service(
+        self, linger_secs: float, *, loop: asyncio.AbstractEventLoop
+    ) -> bool:
+        config = Config()
+        lake_factory = RpcSubprocessFactory(config.lake_cmd, loop=loop)
+        life_saver = LifeSaver()
+        center = WebleankCenter(lake_factory, life_saver)
+        socket_server = LeankSocketServer(center)
+        web_port_server = LeankWebServer(center, config.allowed_domains)
+        this_process_got_it = await web_port_server.bind_port(self._web_port)
+        if not this_process_got_it:
+            # assume another process is running as service
+            return False
+        try:
+            async with TaskGroup() as tg:
+                tg.create_task(web_port_server.start_serving())
+                tg.create_task(socket_server.start_serving(self._sock_path))
+                if self._stdin_eof_event.is_set():
+                    # stdin is already EOF, so run in daemon-like mode
+                    # linger alive for seconds when there are no connection
+                    tg.create_task(
+                        life_saver.stay_alive(center.has_sessions, linger_secs)
+                    )
+                else:
+                    # use stdin EOF as expiration instead of lingering
+                    self._stdin_eof_event = life_saver.expire_event
+                    tip = "Press CTRL-D (EOF) to stop waiting for new connections ..."
+                    print(tip, flush=True)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(self._sock_path)
+                log.debug(f"Deleted socket {self._sock_path}")
+        return True

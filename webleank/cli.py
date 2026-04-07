@@ -3,23 +3,19 @@ Link Lean sidekick web apps to LSP-enabled editors
 '''
 
 import argparse, asyncio, logging, socket, subprocess, sys
-from pathlib import Path
 from typing import Any
 
-from .server import run_service
+from .service import ServiceProgram, socket_available
 from .util import log, version
 
-from lspleanklib import get_user_socket_path, lspleank_connect_main
+from lspleanklib import (
+    async_stdio_main,
+    get_user_socket_path,
+    lspleank_connect_main,
+)
 
 
-async def socket_available(sock_path: Path) -> bool:
-    for i in range(8):
-        try:
-            await asyncio.open_unix_connection(sock_path)
-            return True
-        except (FileNotFoundError, ConnectionRefusedError):
-            await asyncio.sleep(0.125)
-    return False
+PROG_NAME = "webleank"
 
 
 def no_stdio_Popen(cmd: list[str], **os_specific_kwargs: Any) -> None:
@@ -33,7 +29,7 @@ def no_stdio_Popen(cmd: list[str], **os_specific_kwargs: Any) -> None:
     )
 
 
-def start_main() -> int:
+def main_subcmd_start() -> int:
     cmd = [sys.executable, '-m', PROG_NAME, 'service']
     if sys.platform != "win32":
         no_stdio_Popen(cmd, start_new_session=True)
@@ -49,27 +45,6 @@ def start_main() -> int:
     sock_path = get_user_socket_path()
     ok = asyncio.run(socket_available(sock_path))
     return 0 if ok else 1
-
-
-LINGER_SECONDS = 5
-
-
-async def service_amain(web_port: int) -> int:
-    try:
-        sock_path = get_user_socket_path()
-        started = await run_service(web_port, sock_path, linger_secs=LINGER_SECONDS)
-        if not started:
-            other_process_got_it = await socket_available(sock_path)
-            if not other_process_got_it:
-                log.error(f"Unable to start server for {sock_path}")
-            return 0 if other_process_got_it else 1
-    except Exception as ex:
-        log.exception(ex)
-        return 1
-    return 0
-
-
-PROG_NAME = "webleank"
 
 
 def main(cmd_line_args: list[str] | None = None) -> int:
@@ -113,7 +88,8 @@ def main(cmd_line_args: list[str] | None = None) -> int:
             start_cmd = [sys.executable, '-m', PROG_NAME, 'start']
             return lspleank_connect_main(start_cmd)
         case 'start':
-            return start_main()
+            return main_subcmd_start()
         case 'service':
-            return asyncio.run(service_amain(args.web_port))
+            sock_path = get_user_socket_path()
+            return async_stdio_main(ServiceProgram(args.web_port, sock_path))
     raise NotImplementedError

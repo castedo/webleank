@@ -7,13 +7,12 @@ import websockets
 
 from lspleanklib import (
     MethodCall as MC,
-    MsgParams,
     Response,
     RpcInterface,
     json_rpc_channel,
 )
 from webleank.jsonrpc import websocket_rpc_channel
-from webleank.server import run_service
+from webleank.service import ServiceProgram
 
 from .util import MockClient, initialize_call
 
@@ -22,14 +21,44 @@ TESTS_DIR = Path(__file__).parent
 CASES_DIR = TESTS_DIR / "cases"
 
 
-@pytest.mark.slow
-async def test_service(tmp_path):
+async def run_mock_daemon(web_port: int, sock_path: Path, linger_secs: float) -> bool:
+    loop = asyncio.get_running_loop()
+    prog = ServiceProgram(web_port, sock_path)
+    prog.on_stdin_eof()
+    return await prog.run_service(linger_secs, loop=loop)
+
+
+async def test_daemon_service(tmp_path):
     ta = asyncio.create_task(
-        run_service(0, tmp_path / "test.sock", linger_secs=0.2)
+        run_mock_daemon(0, tmp_path / "test.sock", linger_secs=0.03)
     )
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.02)
     assert not ta.done()
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.03)
+    assert ta.done()
+    assert ta.result() == True
+
+
+async def test_stdin_service_stay(tmp_path):
+    loop = asyncio.get_running_loop()
+    prog = ServiceProgram(0, tmp_path / "test.sock")
+    ta = asyncio.create_task(prog.run_service(0.01, loop=loop))
+    await asyncio.sleep(0.04)
+    assert not ta.done()
+    prog.on_stdin_eof()
+    await asyncio.sleep(0.01)
+    assert ta.done()
+    assert ta.result() == True
+
+
+async def test_stdin_service_no_linger(tmp_path):
+    loop = asyncio.get_running_loop()
+    prog = ServiceProgram(0, tmp_path / "test.sock")
+    ta = asyncio.create_task(prog.run_service(4, loop=loop))
+    await asyncio.sleep(0.01)
+    assert not ta.done()
+    prog.on_stdin_eof()
+    await asyncio.sleep(0.01)
     assert ta.done()
     assert ta.result() == True
 
@@ -39,8 +68,9 @@ async def server_session_init(client: RpcInterface, root: Path, web_port: int):
   with tempfile.TemporaryDirectory() as tmp_dir:
     loop = asyncio.get_running_loop()
     sock_path = Path(tmp_dir) / "test.sock"
-    service_task = asyncio.create_task(run_service(web_port, sock_path, linger_secs=0.1))
-    await asyncio.sleep(0.05)
+    prog = ServiceProgram(web_port, sock_path)
+    service_task = asyncio.create_task(prog.run_service(1000, loop=loop))
+    await asyncio.sleep(0.01)
 
     reader, writer = await asyncio.open_unix_connection(sock_path)
     chan = json_rpc_channel(reader, writer, name='socket', loop=loop)
@@ -60,14 +90,14 @@ async def server_session_init(client: RpcInterface, root: Path, web_port: int):
     await rpc.notify(MC('exit'))
     await rpc.close_and_wait()
 
+    prog.on_stdin_eof()
     await service_task
     assert service_task.result() == True
 
 
-@pytest.mark.slow
 async def test_socket_connect():
     async with server_session_init(MockClient(), TESTS_DIR, 41342):
-        await asyncio.sleep(0.1)
+        pass
 
 
 @pytest.mark.slow
@@ -76,8 +106,6 @@ async def test_sidekick_connect():
     leank_client = MockClient()
     root_dir = CASES_DIR / "min_import"
     async with server_session_init(leank_client, root_dir, web_port) as rpc:
-        await asyncio.sleep(0.1)
-
         sidekick = MockClient()
         uri = f"ws://localhost:{web_port}/ws/sidekick"
         origin = "https://foo.castedo.com"
