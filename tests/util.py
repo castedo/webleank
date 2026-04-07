@@ -29,6 +29,9 @@ class MockClient(RpcInterface):
             self.notifs[method] = f
         return f
 
+    async def close_and_wait(self) -> None:
+        pass
+
     async def notify(self, mc: MethodCall) -> None:
         f = self.notifs.pop(mc.method, None)
         if f is not None:
