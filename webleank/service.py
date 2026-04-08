@@ -34,48 +34,21 @@ from .jsonrpc import websocket_rpc_channel
 from .util import awaitable, get_obj, get_str, log, version
 
 
-class VirtualEditor:
-    def __init__(self) -> None:
-        self._doc_highlight: MsgParams | None = None
-        self._sidekicks: list[SidekickSession] = []
-        self.lake_server: RpcInterface | None = None
-
-    async def run(self, chan: RpcChannel, lake_factory: RpcDirChannelFactory) -> None:
-        async with TaskGroup() as session_tasks:
-            leank_client = chan.proxy
-            lake_client = LakeClient(leank_client, self)
-            self.lake_server = channel_lsp_server(
-                lake_factory, lake_client, session_tasks
-            )
-            leank_server = LeankServer(self.lake_server, self)
-            await chan.pump(leank_server)
-        self.lake_server = None
+class LakeWorkspace:
+    def __init__(self, lake_server: RpcInterface, center: WebleankCenter) -> None:
+        self.lake_server = lake_server
+        self._center = center
+        self.doc_highlight: MsgParams | None = None
 
     async def on_notify_from_lake(self, mc: MethodCall) -> None:
         if mc.method == '$/lean/fileProgress':
-            for s in self._sidekicks:
+            # TODO dehack
+            for s in self._center._sidekicks:
                 await s.notify_sidekick(mc)
 
     async def on_doc_highlight(self, params: MsgParams) -> None:
-        self._doc_highlight = params
-        if self._doc_highlight is not None:
-            for s in self._sidekicks:
-                mc = MethodCall('documentHighlight', self._doc_highlight)
-                await s.notify_sidekick(mc)
-
-    async def attach(self, sidekick: SidekickSession) -> None:
-        self._sidekicks.append(sidekick)
-        if self._doc_highlight is not None:
-            mc = MethodCall('documentHighlight', self._doc_highlight)
-            await sidekick.notify_sidekick(mc)
-
-    def deattach(self, sidekick: SidekickSession) -> None:
-        self._sidekicks.remove(sidekick)
-
-    def close(self) -> None:
-        while len(self._sidekicks):
-            s = self._sidekicks.pop()
-            s.veditor_close()
+        self.doc_highlight = params
+        await self._center.on_doc_highlight_changed(self)
 
 
 SIDEKICK_SERVER_API_REQUEST_METHODS = {
@@ -85,17 +58,13 @@ SIDEKICK_SERVER_API_REQUEST_METHODS = {
 
 
 class SidekickSession(RpcInterface):
-    def __init__(self, channel: RpcChannel) -> None:
-        self._veditor: VirtualEditor | None = None
+    def __init__(self, center: WebleankCenter, channel: RpcChannel) -> None:
+        self._center = center
         self._channel = channel
 
     async def run(self) -> None:
         await self._channel.proxy.notify(MethodCall('ack'))
         await self._channel.pump(self)
-        self._server_api = None
-        if self._veditor:
-            self._veditor.deattach(self)
-            self._veditor = None
 
     async def close_and_wait(self) -> None:
         await self._channel.proxy.close_and_wait()
@@ -106,25 +75,17 @@ class SidekickSession(RpcInterface):
     async def request(
         self, mc: MethodCall, fix_id: str | None = None
     ) -> Awaitable[Response]:
-        if (
-            self._veditor
-            and self._veditor.lake_server
-            and mc.method in SIDEKICK_SERVER_API_REQUEST_METHODS
-        ):
-            return await self._veditor.lake_server.request(mc, fix_id)
+        if mc.method in SIDEKICK_SERVER_API_REQUEST_METHODS:
+            return await self._center.lake_request(mc, fix_id)
         else:
             return awaitable_error(ErrorCode.MethodNotFound)
 
-    async def on_new_active_veditor(self, new: VirtualEditor) -> None:
-        self._veditor = new
-        await self._veditor.attach(self)
-        await self._channel.proxy.notify(MethodCall('active'))
-
-    def veditor_close(self) -> None:
-        self._veditor = None
-
     async def notify_sidekick(self, mc: MethodCall) -> None:
         await self._channel.proxy.notify(mc)
+
+    async def notify_doc_highlight(self, doc_highlight: MsgParams) -> None:
+        mc = MethodCall('documentHighlight', doc_highlight)
+        await self.notify_sidekick(mc)
 
 
 LSP_CLIENT_NAME = "webleank"
@@ -144,9 +105,9 @@ def leank_init_response(lake_init_response: Response) -> Response:
 
 
 class LakeClient(RpcInterface):
-    def __init__(self, leank_client: RpcInterface, veditor: VirtualEditor):
+    def __init__(self, leank_client: RpcInterface, space: LakeWorkspace):
         self.client = leank_client
-        self._veditor = veditor
+        self._space = space
 
     async def close_and_wait(self) -> None:
         await self.client.close_and_wait()
@@ -155,7 +116,7 @@ class LakeClient(RpcInterface):
         if not mc.method.startswith('$/lean/'):
             await self.client.notify(mc)
         else:
-            await self._veditor.on_notify_from_lake(mc)
+            await self._space.on_notify_from_lake(mc)
 
     async def request(
         self, mc: MethodCall, fix_id: str | None = None
@@ -178,9 +139,9 @@ def initialize_call(leank_params: LspAny) -> MethodCall:
 
 
 class LeankServer(RpcInterface):
-    def __init__(self, lake_server: RpcInterface, veditor: VirtualEditor):
+    def __init__(self, lake_server: RpcInterface):
         self._lake_server = lake_server
-        self._veditor = veditor
+        self.space: LakeWorkspace | None = None
 
     async def close_and_wait(self) -> None:
         await self._lake_server.close_and_wait()
@@ -198,7 +159,8 @@ class LeankServer(RpcInterface):
         elif mc.method == "textDocument/documentHighlight":
             aw_response = await self._lake_server.request(mc)
             if mc.params is not None:
-                await self._veditor.on_doc_highlight(mc.params)
+                if self.space is not None:
+                    await self.space.on_doc_highlight(mc.params)
             return aw_response
         else:
             return await self._lake_server.request(mc)
@@ -228,45 +190,53 @@ class LifeSaver:
 
 
 class WebleankCenter:
-    def __init__(self, lake_factory: RpcDirChannelFactory, life_saver: LifeSaver):
-        self._lake_factory = lake_factory
+    def __init__(self, life_saver: LifeSaver):
         self.life_saver = life_saver
-        self._veditors: list[VirtualEditor] = []
+        self._spaces: list[LakeWorkspace] = []
         self._sidekicks: list[SidekickSession] = []
+        self.active: LakeWorkspace | None = None
 
     def has_sessions(self) -> bool:
-        return bool(self._veditors) or bool(self._sidekicks)
+        return bool(self._spaces) or bool(self._sidekicks)
 
-    async def on_new_active_veditor(self, new: VirtualEditor) -> None:
-        for s in self._sidekicks:
-            await s.on_new_active_veditor(new)
+    def open_leank_session(
+        self, lake_server: RpcInterface, leank_client: RpcInterface | None
+    ) -> LakeWorkspace:
+        # TODO pass leank_client too
+        spa = LakeWorkspace(lake_server, self)
+        self._spaces.append(spa)
+        return spa
 
-    async def leank_socket_run(self, chan: RpcChannel) -> None:
-        ved = VirtualEditor()
-        self._veditors.append(ved)
-        if len(self._veditors) == 1:
-            await self.on_new_active_veditor(ved)
-        try:
-            await ved.run(chan, self._lake_factory)
-        except Exception:
-            log.exception("Leank socket LSP server session exception")
-        active_veditor_change = bool(ved == self._veditors[0])
-        self._veditors.remove(ved)
-        if active_veditor_change and len(self._veditors):
-            await self.on_new_active_veditor(self._veditors[0])
+    async def on_doc_highlight_changed(self, spa: LakeWorkspace) -> None:
+        if spa.doc_highlight:
+            self.active = spa
+            for s in self._sidekicks:
+                await s.notify_doc_highlight(spa.doc_highlight)
+
+    def close_leank_session(self, sess: LakeWorkspace) -> None:
+        self._spaces.remove(sess)
         self.life_saver.on_life_event()
 
+    async def lake_request(
+        self, mc: MethodCall, fix_id: str | None = None
+    ) -> Awaitable[Response]:
+        if self.active:
+            return await self.active.lake_server.request(mc, fix_id)
+        else:
+            return awaitable_error(ErrorCode.InternalError)
+
     async def sidekick_websocket_run(self, chan: RpcChannel) -> None:
-        sess = SidekickSession(chan)
+        sess = SidekickSession(self, chan)
         self._sidekicks.append(sess)
-        if len(self._veditors):
-            await sess.on_new_active_veditor(self._veditors[0])
         try:
+            if self.active and self.active.doc_highlight:
+                await sess.notify_doc_highlight(self.active.doc_highlight)
             await sess.run()
         except Exception:
             log.exception("Sidekick session exception")
-        self._sidekicks.remove(sess)
-        self.life_saver.on_life_event()
+        finally:
+            self._sidekicks.remove(sess)
+            self.life_saver.on_life_event()
 
     async def control_websocket_run(self, chan: RpcChannel) -> None:
         # TODO something diff than sidekick
@@ -370,9 +340,42 @@ class LeankWebServer:
         return None
 
 
-class LeankSocketServer:
-    def __init__(self, center: WebleankCenter):
+class LeankChannel(RpcChannel):
+    def __init__(self, lake_channel: RpcChannel, center: WebleankCenter):
+        self._lake_channel = lake_channel
         self._center = center
+        self._leank_server = LeankServer(lake_channel.proxy)
+
+    @property
+    def proxy(self) -> RpcInterface:
+        return self._leank_server
+
+    async def pump(self, leank_client: RpcInterface | None = None) -> None:
+        sess = self._center.open_leank_session(self._lake_channel.proxy, leank_client)
+        try:
+            self._leank_server.space = sess
+            impl = None if leank_client is None else LakeClient(leank_client, sess)
+            await self._lake_channel.pump(impl)
+        finally:
+            self._center.close_leank_session(sess)
+
+
+class LeankChannelFactory(RpcDirChannelFactory):
+    def __init__(self, lake_factory: RpcDirChannelFactory, center: WebleankCenter):
+        self._lake_factory = lake_factory
+        self._center = center
+
+    async def anew(self, work_root: Path) -> RpcChannel:
+        lake_channel = await self._lake_factory.anew(work_root)
+        return LeankChannel(lake_channel, self._center)
+
+    async def await_expire(self) -> None:
+        await self._center.life_saver.expire_event.wait()
+
+
+class LeankSocketServer:
+    def __init__(self, lake_factory: RpcDirChannelFactory, center: WebleankCenter):
+        self._leank_factory = LeankChannelFactory(lake_factory, center)
         self._loop = asyncio.get_running_loop()
 
     async def start_serving(self, sock_path: Path) -> None:
@@ -381,14 +384,21 @@ class LeankSocketServer:
         )
         async with srvr:
             await srvr.start_serving()
-            await self._center.life_saver.expire_event.wait()
+            await self._leank_factory.await_expire()
 
     async def _on_connect(
         self, ain: asyncio.StreamReader, aout: asyncio.StreamWriter
     ) -> None:
         log.debug("socket connected")
-        sock_chan = json_rpc_channel(ain, aout, name='socket', loop=self._loop)
-        await self._center.leank_socket_run(sock_chan)
+        try:
+            sock_chan = json_rpc_channel(ain, aout, name='socket', loop=self._loop)
+            async with TaskGroup() as tg:
+                server = channel_lsp_server(self._leank_factory, sock_chan.proxy, tg)
+                tg.create_task(sock_chan.pump(server))
+        except Exception:
+            log.exception("Leank socket LSP server session exception")
+        finally:
+            log.debug("socket disconnected")
 
 
 CONFIG_FILENAME = 'webleank.toml'
@@ -465,8 +475,8 @@ class ServiceProgram(AsyncProgram):
         config = Config()
         lake_factory = RpcSubprocessFactory(config.lake_cmd, loop=loop)
         life_saver = LifeSaver()
-        center = WebleankCenter(lake_factory, life_saver)
-        socket_server = LeankSocketServer(center)
+        center = WebleankCenter(life_saver)
+        socket_server = LeankSocketServer(lake_factory, center)
         web_port_server = LeankWebServer(center, config.allowed_domains)
         this_process_got_it = await web_port_server.bind_port(self._web_port)
         if not this_process_got_it:

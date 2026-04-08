@@ -169,3 +169,17 @@ async def test_doc_highlight(work_root):
         sidekick = MockClient()
         async with sidekick_session_init(sidekick, web_port):
             await assert_doc_highlight(sidekick, rpc)
+
+
+@pytest.mark.slow
+async def test_doc_highlight_two_workspaces():
+    async with webleank_service() as (web_port, sock_path):
+        work_root1 = CASES_DIR
+        client1 = MockClient()
+        async with leank_session_init(sock_path, client1, work_root1):
+            work_root2 = CASES_DIR / "min_import"
+            client2 = MockClient()
+            async with leank_session_init(sock_path, client2, work_root2) as rpc2:
+                sidekick = MockClient()
+                async with sidekick_session_init(sidekick, web_port):
+                    await assert_doc_highlight(sidekick, rpc2)
