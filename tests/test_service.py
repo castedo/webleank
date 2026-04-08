@@ -92,7 +92,11 @@ async def leank_session_init(sock_path: Path, client: RpcInterface, work_root: P
     aw_resp = await rpc.request(initialize_call(work_root))
     server_init = await aw_resp
     assert isinstance(server_init.result, dict)
-    assert server_init.result['serverInfo']['name'] == "Lean 4 Server"
+    assert server_init.result['serverInfo']['name'] == "webleank"
+    server_caps = server_init.result['capabilities']
+    assert 'experimental' not in server_caps
+    assert 'inlayHintProvider' not in server_caps
+    assert 'semanticTokensProvider' not in server_caps
     await rpc.notify(MC('initialized', {}))
 
     yield rpc

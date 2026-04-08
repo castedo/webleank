@@ -27,7 +27,10 @@ from lspleanklib import (
     RpcSubprocessFactory,
     awaitable_error,
     channel_lsp_server,
+    is_excluded_method,
+    is_ok_method,
     json_rpc_channel,
+    standardize_server_capabilities,
 )
 
 from .jsonrpc import websocket_rpc_channel
@@ -95,10 +98,14 @@ LSP_SERVER_NAME = "webleank"
 def leank_init_response(lake_init_response: Response) -> Response:
     if lake_init_response.error is not None:
         return lake_init_response
+    if isinstance(lake_init_response.result, dict):
+        server_caps = lake_init_response.result.get('capabilities')
+        server_caps = standardize_server_capabilities(server_caps)
+    else:
+        server_caps = {}
     return Response(
         {
-            # TODO check and standardize server caps
-            'capabilities': get_obj(lake_init_response.result, 'capabilities'),
+            'capabilities': server_caps,
             'serverInfo': {'name': LSP_SERVER_NAME, 'version': version()},
         }
     )
@@ -113,17 +120,22 @@ class LakeClient(RpcInterface):
         await self.client.close_and_wait()
 
     async def notify(self, mc: MethodCall) -> None:
-        if not mc.method.startswith('$/lean/'):
+        if not is_excluded_method(mc.method):
             await self.client.notify(mc)
+            if not is_ok_method(mc.method):
+                log.info(f"Unknown notification '{mc.method}' from Lake LSP")
         else:
             await self._space.on_notify_from_lake(mc)
 
     async def request(
         self, mc: MethodCall, fix_id: str | None = None
     ) -> Awaitable[Response]:
-        if mc.method == "client/registerCapability":
+        if is_excluded_method(mc.method):
             return awaitable_error(ErrorCode.MethodNotFound)
-        return await self.client.request(mc, fix_id)
+        else:
+            if not is_ok_method(mc.method):
+                log.info(f"Unknown request '{mc.method}' from Lake LSP")
+            return await self.client.request(mc, fix_id)
 
 
 def initialize_call(leank_params: LspAny) -> MethodCall:
@@ -152,7 +164,7 @@ class LeankServer(RpcInterface):
     async def request(
         self, mc: MethodCall, fix_id: str | None = None
     ) -> Awaitable[Response]:
-        if mc.method == "initialized":
+        if mc.method == "initialize":
             aw_response = await self._lake_server.request(initialize_call(mc.params))
             response = await aw_response
             return awaitable(leank_init_response(response))
