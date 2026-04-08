@@ -422,21 +422,17 @@ class Config:
         self.lake_cmd = data.get('lake', {}).get('cmd', ['lake', 'serve'])
 
 
-async def socket_available(
-    sock_path: Path, *, loop: asyncio.AbstractEventLoop | None = None
-) -> bool:
-    if loop is None:
-        loop = asyncio.get_running_loop()
+async def socket_available(sock_path: Path) -> bool:
     for i in range(8):
         try:
-            await asyncio.open_unix_connection(sock_path, loop=loop)
+            await asyncio.open_unix_connection(sock_path)
             return True
         except (FileNotFoundError, ConnectionRefusedError):
             await asyncio.sleep(0.125)
     return False
 
 
-LINGER_SECONDS = 5
+LINGER_SECONDS = float(os.environ.get("WEBLEANK_LINGER_SECONDS", 5))
 
 
 class ServiceProgram(AsyncProgram):
@@ -451,7 +447,7 @@ class ServiceProgram(AsyncProgram):
         try:
             started = await self.run_service(linger_secs=LINGER_SECONDS, loop=loop)
             if not started:
-                other_proc_got_it = await socket_available(self._sock_path, loop=loop)
+                other_proc_got_it = await socket_available(self._sock_path)
                 if not other_proc_got_it:
                     log.error(f"Unable to start server for {self._sock_path}")
                 return 0 if other_proc_got_it else 1
