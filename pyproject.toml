@@ -16,7 +16,7 @@ classifiers = [
 ]
 keywords = ["lean", "lsp", "language-server-protocol"]
 dependencies = [
-    "lspleanklib>=0.2",
+    "lspleanklib>=0.3",
     "platformdirs",
     "websockets>=14.2",
 ]
